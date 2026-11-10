@@ -43,6 +43,7 @@ data class SimSlotInfo(
 
 data class GatekeeperConfig(
     val selectedSimSlot: Int = 0, // 0 = SIM 1, 1 = SIM 2
+    val requireStrictNrState: Boolean = false, // true = require NR State: CONNECTED; false = allow when 5G NSA (NR_NSA) is active
     val heartbeatIp: String = "1.1.1.1",
     val gracePeriodMs: Long = 2500L,
     val heartbeatIntervalMs: Long = 3000L,

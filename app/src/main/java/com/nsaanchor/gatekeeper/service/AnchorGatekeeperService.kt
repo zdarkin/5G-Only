@@ -75,6 +75,34 @@ class AnchorGatekeeperService : Service() {
         }
         observeFirewallConfigChanges()
         observeSelectedSimChanges()
+        observeStrictNrStateChanges()
+    }
+
+    private fun observeStrictNrStateChanges() {
+        serviceScope.launch {
+            GatekeeperRepository.uiState
+                .map { it.config.requireStrictNrState }
+                .distinctUntilChanged()
+                .drop(1)
+                .collect { isStrict ->
+                    if (isShuttingDown || !GatekeeperRepository.uiState.value.isServiceRunning) return@collect
+                    GatekeeperRepository.log(
+                        LogLevel.INFO,
+                        "Strict NR State mode changed to $isStrict -> Re-evaluating signal snapshot"
+                    )
+                    latestSnapshot?.let { snapshot ->
+                        val reEvaluated = TelephonyNsaMonitor.evaluateSnapshot(
+                            simSlotIndex = snapshot.simSlotIndex,
+                            subscriptionId = snapshot.subscriptionId,
+                            networkType = snapshot.networkType,
+                            overrideNetworkType = snapshot.overrideNetworkType,
+                            nrState = snapshot.nrState,
+                            requireStrictNrState = isStrict
+                        )
+                        onSnapshotChanged(reEvaluated)
+                    }
+                }
+        }
     }
 
     private fun observeFirewallConfigChanges() {

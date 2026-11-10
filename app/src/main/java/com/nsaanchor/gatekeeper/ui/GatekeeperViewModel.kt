@@ -54,6 +54,10 @@ class GatekeeperViewModel : ViewModel() {
         GatekeeperRepository.updateConfig { it.copy(heartbeatIntervalMs = ms) }
     }
 
+    fun updateRequireStrictNrState(enabled: Boolean) {
+        GatekeeperRepository.updateConfig { it.copy(requireStrictNrState = enabled) }
+    }
+
     fun updateBlockIpv6(enabled: Boolean) {
         GatekeeperRepository.updateConfig { it.copy(blockIpv6 = enabled) }
     }

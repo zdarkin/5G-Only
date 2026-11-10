@@ -7,6 +7,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,10 +30,25 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build Debug APK and Run Unit Tests
-        run: gradle assembleDebug testDebugUnitTest --stacktrace
+        run: ./gradlew assembleDebug testDebugUnitTest --stacktrace
 
-      - name: Upload Debug APK
+      - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: nsa-5g-anchor-gatekeeper-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+
+      - name: Publish Direct APK Download Release
+        if: github.event_name == 'push' && github.ref_name == 'main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Gatekeeper Build"
+          body: |
+            Direct APK download for 5G NSA Anchor & Gatekeeper.
+            Tap the `app-debug.apk` asset below to install directly on your phone without unzipping!
+          draft: false
+          prerelease: false
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

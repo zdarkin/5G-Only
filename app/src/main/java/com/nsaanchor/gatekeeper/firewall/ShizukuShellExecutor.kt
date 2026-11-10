@@ -248,8 +248,22 @@ object ShizukuShellExecutor {
                     }
                 }
 
-                val finished = createdProcess.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-                if (!finished) {
+                // ShizukuRemoteProcess extends java.lang.Process but its exitValue() throws
+                // IllegalArgumentException("process hasn't exited") instead of IllegalThreadStateException
+                // when called before completion. Java's default waitFor(timeout, unit) only catches
+                // IllegalThreadStateException, causing an unhandled IllegalArgumentException.
+                // Using coroutine withTimeoutOrNull with blocking waitFor() cleanly avoids this bug.
+                val exitCode = withTimeoutOrNull(timeoutMs) {
+                    withContext(Dispatchers.IO) {
+                        try {
+                            createdProcess.waitFor()
+                        } catch (_: InterruptedException) {
+                            -1
+                        }
+                    }
+                }
+
+                if (exitCode == null) {
                     destroyProcessSafely(createdProcess)
                     val partialOut = withTimeoutOrNull(250L) {
                         runCatching { stdoutDeferred.await() }.getOrDefault("")
@@ -274,9 +288,8 @@ object ShizukuShellExecutor {
 
                 val stdoutText = stdoutDeferred.await()
                 val stderrText = stderrDeferred.await()
-                val code = createdProcess.exitValue()
                 ShellResult(
-                    exitCode = code,
+                    exitCode = exitCode,
                     stdout = stdoutText,
                     stderr = stderrText
                 )

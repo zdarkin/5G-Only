@@ -84,18 +84,34 @@ class IptablesFirewallManagerTest {
     }
 
     @Test
-    fun `evaluateSnapshot keeps traffic blocked when override is NR_NSA but nrState is NOT_RESTRICTED`() {
+    fun `evaluateSnapshot keeps traffic blocked when override is NR_NSA but nrState is NOT_RESTRICTED under strict mode`() {
         val snapshot = TelephonyNsaMonitor.evaluateSnapshot(
             simSlotIndex = 0,
             subscriptionId = 1,
             networkType = TelephonyManager.NETWORK_TYPE_LTE,
             overrideNetworkType = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA,
-            nrState = "NOT_RESTRICTED"
+            nrState = "NOT_RESTRICTED",
+            requireStrictNrState = true
         )
 
         assertFalse(snapshot.is5gNsaOrBetter)
         assertTrue(snapshot.isLteOnly)
         assertEquals("NOT_RESTRICTED", snapshot.nrState)
+    }
+
+    @Test
+    fun `evaluateSnapshot unblocks traffic when override is NR_NSA under standard mode`() {
+        val snapshot = TelephonyNsaMonitor.evaluateSnapshot(
+            simSlotIndex = 0,
+            subscriptionId = 1,
+            networkType = TelephonyManager.NETWORK_TYPE_LTE,
+            overrideNetworkType = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA,
+            nrState = "NONE",
+            requireStrictNrState = false
+        )
+
+        assertTrue(snapshot.is5gNsaOrBetter)
+        assertFalse(snapshot.isLteOnly)
     }
 
     @Test

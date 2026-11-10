@@ -326,13 +326,29 @@ class TelephonyNsaMonitor(
                     command = "dumpsys telephony.registry",
                     timeoutMs = 2500L
                 )
-                if (!result.isSuccess || result.stdout.isBlank()) return@launch
+                if (!result.isSuccess || result.stdout.isBlank()) {
+                    if (result.stderr.isNotBlank()) {
+                        GatekeeperRepository.log(
+                            LogLevel.WARN,
+                            "Shizuku Dumpsys check: ${result.stderr.trim()}"
+                        )
+                    }
+                    return@launch
+                }
 
                 val unredactedNrState = extractNrStateFromDumpsysOrNull(
                     dumpsysOutput = result.stdout,
                     simSlotIndex = simSlotIndex,
                     subscriptionId = subscriptionId
                 )
+
+                if (unredactedNrState != null) {
+                    GatekeeperRepository.log(
+                        LogLevel.INFO,
+                        "Shizuku Dumpsys parsed NR State (SIM ${simSlotIndex + 1}): $unredactedNrState"
+                    )
+                }
+
                 if (unredactedNrState != null &&
                     unredactedNrState != lastNrState &&
                     isRegistered &&
@@ -354,12 +370,14 @@ class TelephonyNsaMonitor(
     }
 
     private fun emitSnapshot(networkType: Int, overrideNetworkType: Int, nrState: String) {
+        val requireStrict = GatekeeperRepository.uiState.value.config.requireStrictNrState
         val snapshot = evaluateSnapshot(
             simSlotIndex = activeSimSlotIndex,
             subscriptionId = activeSubscriptionId,
             networkType = networkType,
             overrideNetworkType = overrideNetworkType,
-            nrState = nrState
+            nrState = nrState,
+            requireStrictNrState = requireStrict
         )
         onSnapshotChanged(snapshot)
     }
@@ -551,9 +569,9 @@ class TelephonyNsaMonitor(
         ): String? {
             if (dumpsysOutput.isBlank()) return null
 
-            // Locate "Phone Id=<simSlotIndex>" section in dumpsys telephony.registry
-            val phoneMarker = Regex("""Phone\s+Id\s*=\s*$simSlotIndex\b""", RegexOption.IGNORE_CASE)
-            val anyPhoneMarker = Regex("""Phone\s+Id\s*=\s*\d+\b""", RegexOption.IGNORE_CASE)
+            // Locate "Phone Id=<simSlotIndex>" or "mPhoneId=<simSlotIndex>" or "slotId=<simSlotIndex>"
+            val phoneMarker = Regex("""(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*$simSlotIndex\b""", RegexOption.IGNORE_CASE)
+            val anyPhoneMarker = Regex("""(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*\d+\b""", RegexOption.IGNORE_CASE)
 
             val startMatch = phoneMarker.find(dumpsysOutput)
             if (startMatch != null) {
@@ -569,7 +587,10 @@ class TelephonyNsaMonitor(
 
             if (subscriptionId >= 0) {
                 val subLineMatch = dumpsysOutput.lineSequence()
-                    .filter { it.contains("mServiceState", ignoreCase = true) && it.contains("$subscriptionId") }
+                    .filter {
+                        (it.contains("mServiceState", ignoreCase = true) || it.contains("ServiceState", ignoreCase = true)) &&
+                            (it.contains("$subscriptionId") || it.contains("subId=$subscriptionId", ignoreCase = true))
+                    }
                     .joinToString("\n")
                 val subNrState = extractNrStateFromTextOrNull(subLineMatch)
                 if (subNrState != null) {
@@ -577,7 +598,7 @@ class TelephonyNsaMonitor(
                 }
             }
 
-            // Only fall back to scanning the full output if no "Phone Id=" sections exist at all
+            // Only fall back to scanning the full output if no phone/slot sections exist at all
             if (anyPhoneMarker.find(dumpsysOutput) == null) {
                 return extractNrStateFromTextOrNull(dumpsysOutput)
             }
@@ -615,30 +636,45 @@ class TelephonyNsaMonitor(
                 overrideNetworkType == OVERRIDE_NR_NSA_MMWAVE
 
         /**
-         * Strictly evaluates whether the cellular radio is truly attached to 5G:
+         * Evaluates whether the cellular radio is considered 5G:
          * - 5G SA (`NETWORK_TYPE_NR`), OR
-         * - 5G NSA with `NR State (NSA) == CONNECTED` (`normalizedNrState == "CONNECTED"`).
-         *
-         * Even if `overrideNetworkType == OVERRIDE_NETWORK_TYPE_NR_NSA` (5G icon shown by carrier),
-         * if `nrState != "CONNECTED"` (e.g. `NOT_RESTRICTED` or `NONE`), `is5gNsaOrBetter` is `false`
-         * so traffic remains blocked and the Bait Heartbeat continues until `NR State` becomes `CONNECTED`.
+         * - If [requireStrictNrState] is true: requires `NR State (NSA) == CONNECTED`.
+         * - If [requireStrictNrState] is false: allows whenever `NR State == CONNECTED` OR carrier shows 5G NSA (`NR_NSA` / `NR_ADVANCED`).
          */
         fun evaluateSnapshot(
             simSlotIndex: Int = 0,
             subscriptionId: Int = -1,
             networkType: Int,
             overrideNetworkType: Int,
-            nrState: String = "NONE"
+            nrState: String = "NONE",
+            requireStrictNrState: Boolean = false
         ): CellularSignalSnapshot {
             val normalizedNrState = normalizeNrState(nrState)
             val is5gSa = networkType == TelephonyManager.NETWORK_TYPE_NR
-            val isNrNsaConnected = normalizedNrState == "CONNECTED" && (
-                networkType == TelephonyManager.NETWORK_TYPE_LTE ||
-                    networkType == TelephonyManager.NETWORK_TYPE_NR ||
-                    networkType == TelephonyManager.NETWORK_TYPE_UNKNOWN
-                )
-            val is5gNsaOrBetter = is5gSa || isNrNsaConnected
+            val hasNsaOverride = hasNsaOverride(overrideNetworkType)
+            val isAnchorCapable = networkType == TelephonyManager.NETWORK_TYPE_LTE ||
+                networkType == TelephonyManager.NETWORK_TYPE_NR ||
+                networkType == TelephonyManager.NETWORK_TYPE_UNKNOWN
+
+            val is5gNsaOrBetter = when {
+                is5gSa -> true
+                requireStrictNrState -> normalizedNrState == "CONNECTED" && isAnchorCapable
+                else -> (normalizedNrState == "CONNECTED" || hasNsaOverride) && isAnchorCapable
+            }
             val isLteOnly = !is5gNsaOrBetter
+
+            return CellularSignalSnapshot(
+                simSlotIndex = simSlotIndex,
+                subscriptionId = subscriptionId,
+                networkType = networkType,
+                overrideNetworkType = overrideNetworkType,
+                nrState = normalizedNrState,
+                networkTypeName = networkTypeToName(networkType),
+                overrideTypeName = overrideTypeToName(overrideNetworkType),
+                is5gNsaOrBetter = is5gNsaOrBetter,
+                isLteOnly = isLteOnly
+            )
+        }
 
             return CellularSignalSnapshot(
                 simSlotIndex = simSlotIndex,

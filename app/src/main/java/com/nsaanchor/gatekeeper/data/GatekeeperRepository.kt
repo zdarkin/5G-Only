@@ -18,6 +18,7 @@ object GatekeeperRepository {
 
     private const val PREFS_NAME = "nsa_anchor_gatekeeper_prefs"
     private const val KEY_SELECTED_SIM_SLOT = "selected_sim_slot"
+    private const val KEY_REQUIRE_STRICT_NR_STATE = "require_strict_nr_state"
     private const val KEY_HEARTBEAT_IP = "heartbeat_ip"
     private const val KEY_GRACE_PERIOD_MS = "grace_period_ms"
     private const val KEY_HEARTBEAT_INTERVAL_MS = "heartbeat_interval_ms"
@@ -40,6 +41,7 @@ object GatekeeperRepository {
         val selectedSlot = sharedPrefs.getInt(KEY_SELECTED_SIM_SLOT, 0).coerceIn(0, 1)
         val loadedConfig = GatekeeperConfig(
             selectedSimSlot = selectedSlot,
+            requireStrictNrState = sharedPrefs.getBoolean(KEY_REQUIRE_STRICT_NR_STATE, false),
             heartbeatIp = sharedPrefs.getString(KEY_HEARTBEAT_IP, "1.1.1.1") ?: "1.1.1.1",
             gracePeriodMs = sharedPrefs.getLong(KEY_GRACE_PERIOD_MS, 2500L),
             heartbeatIntervalMs = sharedPrefs.getLong(KEY_HEARTBEAT_INTERVAL_MS, 3000L),
@@ -74,6 +76,7 @@ object GatekeeperRepository {
         updatedConfig?.let { cfg ->
             prefs?.edit()?.apply {
                 putInt(KEY_SELECTED_SIM_SLOT, cfg.selectedSimSlot.coerceIn(0, 1))
+                putBoolean(KEY_REQUIRE_STRICT_NR_STATE, cfg.requireStrictNrState)
                 putString(KEY_HEARTBEAT_IP, cfg.heartbeatIp)
                 putLong(KEY_GRACE_PERIOD_MS, cfg.gracePeriodMs)
                 putLong(KEY_HEARTBEAT_INTERVAL_MS, cfg.heartbeatIntervalMs)

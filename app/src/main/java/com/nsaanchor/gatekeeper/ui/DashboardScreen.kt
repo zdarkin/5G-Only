@@ -131,6 +131,7 @@ fun DashboardScreen(
         onRequestShizukuPermission = { viewModel.requestShizukuPermission() },
         onRequestAndroidPermissions = onRequestPermissions,
         onSelectSimSlot = { slotIndex -> viewModel.selectSimSlot(context, slotIndex) },
+        onUpdateRequireStrictNrState = { viewModel.updateRequireStrictNrState(it) },
         onUpdateHeartbeatIp = { viewModel.updateHeartbeatIp(it) },
         onUpdateGracePeriodMs = { viewModel.updateGracePeriodMs(it) },
         onUpdateHeartbeatIntervalMs = { viewModel.updateHeartbeatIntervalMs(it) },
@@ -150,6 +151,7 @@ fun DashboardContent(
     onRequestShizukuPermission: () -> Unit,
     onRequestAndroidPermissions: () -> Unit,
     onSelectSimSlot: (Int) -> Unit,
+    onUpdateRequireStrictNrState: (Boolean) -> Unit,
     onUpdateHeartbeatIp: (String) -> Unit,
     onUpdateGracePeriodMs: (Long) -> Unit,
     onUpdateHeartbeatIntervalMs: (Long) -> Unit,
@@ -210,6 +212,7 @@ fun DashboardContent(
             // 5. Settings Card (Collapsed by default!)
             SettingsCard(
                 uiState = uiState,
+                onUpdateRequireStrictNrState = onUpdateRequireStrictNrState,
                 onUpdateHeartbeatIp = onUpdateHeartbeatIp,
                 onUpdateGracePeriodMs = onUpdateGracePeriodMs,
                 onUpdateHeartbeatIntervalMs = onUpdateHeartbeatIntervalMs,
@@ -844,6 +847,7 @@ private fun MetricBox(
 @Composable
 private fun SettingsCard(
     uiState: GatekeeperUiState,
+    onUpdateRequireStrictNrState: (Boolean) -> Unit,
     onUpdateHeartbeatIp: (String) -> Unit,
     onUpdateGracePeriodMs: (Long) -> Unit,
     onUpdateHeartbeatIntervalMs: (Long) -> Unit,
@@ -913,6 +917,44 @@ private fun SettingsCard(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     HorizontalDivider(color = SlateBorder.copy(alpha = 0.6f))
+
+                    // 0. Strict NR State Toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Require NR State: CONNECTED",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = if (uiState.config.requireStrictNrState) {
+                                    "Strict: data allowed only when NR State is CONNECTED (*#*#4636#*#*)"
+                                } else {
+                                    "Standard: data allowed whenever 5G NSA (NR_NSA) is active"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = TextSecondary,
+                                fontSize = 10.sp
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = uiState.config.requireStrictNrState,
+                            onCheckedChange = onUpdateRequireStrictNrState,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = TextPrimary,
+                                checkedTrackColor = EmeraldGreen,
+                                uncheckedThumbColor = TextSecondary,
+                                uncheckedTrackColor = SlateCardElevated
+                            )
+                        )
+                    }
 
                     // 1. Heartbeat IP (1.1.1.1 / 8.8.8.8 / Custom)
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
