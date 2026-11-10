@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">5G NSA Anchor &amp; Gatekeeper</string>
+    <string name="notification_channel_name">5G NSA Anchor Service</string>
+    <string name="notification_channel_desc">Persistent status and instant emergency toggle for 5G NSA Anchor &amp; Hotspot Gatekeeper</string>
+</resources>
