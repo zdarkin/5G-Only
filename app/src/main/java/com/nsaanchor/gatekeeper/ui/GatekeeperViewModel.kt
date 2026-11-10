@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import com.nsaanchor.gatekeeper.data.GatekeeperRepository
 import com.nsaanchor.gatekeeper.firewall.ShizukuShellExecutor
 import com.nsaanchor.gatekeeper.model.GatekeeperUiState
+import com.nsaanchor.gatekeeper.network.TelephonyNsaMonitor
 import com.nsaanchor.gatekeeper.service.AnchorGatekeeperService
 import kotlinx.coroutines.flow.StateFlow
 
@@ -30,6 +31,15 @@ class GatekeeperViewModel : ViewModel() {
 
     fun requestShizukuPermission() {
         ShizukuShellExecutor.requestPermission()
+    }
+
+    fun selectSimSlot(context: Context, slotIndex: Int) {
+        GatekeeperRepository.updateConfig { it.copy(selectedSimSlot = slotIndex.coerceIn(0, 1)) }
+        TelephonyNsaMonitor.discoverSims(context)
+    }
+
+    fun refreshSims(context: Context) {
+        TelephonyNsaMonitor.discoverSims(context)
     }
 
     fun updateHeartbeatIp(ip: String) {

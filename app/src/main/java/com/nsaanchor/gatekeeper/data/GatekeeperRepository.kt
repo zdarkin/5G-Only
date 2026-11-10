@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
 object GatekeeperRepository {
 
     private const val PREFS_NAME = "nsa_anchor_gatekeeper_prefs"
+    private const val KEY_SELECTED_SIM_SLOT = "selected_sim_slot"
     private const val KEY_HEARTBEAT_IP = "heartbeat_ip"
     private const val KEY_GRACE_PERIOD_MS = "grace_period_ms"
     private const val KEY_HEARTBEAT_INTERVAL_MS = "heartbeat_interval_ms"
@@ -36,15 +37,25 @@ object GatekeeperRepository {
     fun init(context: Context) {
         val sharedPrefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs = sharedPrefs
+        val selectedSlot = sharedPrefs.getInt(KEY_SELECTED_SIM_SLOT, 0).coerceIn(0, 1)
         val loadedConfig = GatekeeperConfig(
+            selectedSimSlot = selectedSlot,
             heartbeatIp = sharedPrefs.getString(KEY_HEARTBEAT_IP, "1.1.1.1") ?: "1.1.1.1",
             gracePeriodMs = sharedPrefs.getLong(KEY_GRACE_PERIOD_MS, 2500L),
             heartbeatIntervalMs = sharedPrefs.getLong(KEY_HEARTBEAT_INTERVAL_MS, 3000L),
             blockIpv6 = sharedPrefs.getBoolean(KEY_BLOCK_IPV6, true),
             customInterfaces = sharedPrefs.getString(KEY_CUSTOM_INTERFACES, "") ?: ""
         )
-        _uiState.update { it.copy(config = loadedConfig) }
-        log(LogLevel.INFO, "GatekeeperRepository initialized (target=${loadedConfig.heartbeatIp}, grace=${loadedConfig.gracePeriodMs}ms)")
+        _uiState.update {
+            it.copy(
+                config = loadedConfig,
+                activeSimLabel = "SIM ${selectedSlot + 1}"
+            )
+        }
+        log(
+            LogLevel.INFO,
+            "GatekeeperRepository initialized (SIM=${selectedSlot + 1}, target=${loadedConfig.heartbeatIp}, grace=${loadedConfig.gracePeriodMs}ms)"
+        )
     }
 
     fun updateState(transform: (GatekeeperUiState) -> GatekeeperUiState) {
@@ -54,12 +65,15 @@ object GatekeeperRepository {
     fun updateConfig(transform: (GatekeeperConfig) -> GatekeeperConfig) {
         var updatedConfig: GatekeeperConfig? = null
         _uiState.update { current ->
-            val newConfig = transform(current.config)
+            val newConfig = transform(current.config).let {
+                it.copy(selectedSimSlot = it.selectedSimSlot.coerceIn(0, 1))
+            }
             updatedConfig = newConfig
             current.copy(config = newConfig)
         }
         updatedConfig?.let { cfg ->
             prefs?.edit()?.apply {
+                putInt(KEY_SELECTED_SIM_SLOT, cfg.selectedSimSlot.coerceIn(0, 1))
                 putString(KEY_HEARTBEAT_IP, cfg.heartbeatIp)
                 putLong(KEY_GRACE_PERIOD_MS, cfg.gracePeriodMs)
                 putLong(KEY_HEARTBEAT_INTERVAL_MS, cfg.heartbeatIntervalMs)

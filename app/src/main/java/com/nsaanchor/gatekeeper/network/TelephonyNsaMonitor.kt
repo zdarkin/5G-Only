@@ -4,15 +4,32 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import android.telephony.ServiceState
+import android.telephony.SubscriptionManager
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyDisplayInfo
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
+import com.nsaanchor.gatekeeper.data.GatekeeperRepository
+import com.nsaanchor.gatekeeper.firewall.ShizukuShellExecutor
+import com.nsaanchor.gatekeeper.model.LogLevel
+import com.nsaanchor.gatekeeper.model.SimSlotInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class CellularSignalSnapshot(
+    val simSlotIndex: Int = 0,
+    val subscriptionId: Int = -1,
     val networkType: Int,
     val overrideNetworkType: Int,
+    val nrState: String = "NONE",
     val networkTypeName: String,
     val overrideTypeName: String,
     val is5gNsaOrBetter: Boolean,
@@ -20,18 +37,28 @@ data class CellularSignalSnapshot(
 )
 
 /**
- * Monitors real-time 5G NSA (EN-DC) vs 4G LTE anchor states on Android 12+ (API 31+).
- *
- * Uses [TelephonyCallback.DisplayInfoListener] and [TelephonyCallback.ServiceStateListener]
- * to distinguish true 5G NSA / 5G NR Advanced secondary carrier attachment from plain 4G LTE
- * or LTE+ Carrier Aggregation.
+ * Monitors real-time 5G NSA (EN-DC) vs 4G LTE anchor states on Android 12+ (API 31+),
+ * pinned strictly to a single user-selected SIM slot (SIM 1 or SIM 2) and enforcing
+ * `NR State (NSA): CONNECTED` before considering 5G NSA active.
  */
 class TelephonyNsaMonitor(
     private val context: Context,
     private val onSnapshotChanged: (CellularSignalSnapshot) -> Unit
 ) {
-    private val telephonyManager: TelephonyManager? =
+    private val baseTelephonyManager: TelephonyManager? =
         context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+
+    private val monitorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val isShizukuProbeInFlight = AtomicBoolean(false)
+
+    @Volatile
+    private var activeTelephonyManager: TelephonyManager? = null
+
+    @Volatile
+    private var activeSimSlotIndex: Int = 0
+
+    @Volatile
+    private var activeSubscriptionId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID
 
     @Volatile
     private var isRegistered = false
@@ -44,6 +71,15 @@ class TelephonyNsaMonitor(
 
     @Volatile
     private var lastOverrideNetworkType: Int = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NONE
+
+    @Volatile
+    private var lastNrState: String = "NONE"
+
+    @Volatile
+    private var lastShizukuProbeElapsedMs: Long = 0L
+
+    @Volatile
+    private var pollingJob: Job? = null
 
     private val telephonyCallback = object :
         TelephonyCallback(),
@@ -60,46 +96,65 @@ class TelephonyNsaMonitor(
             val overrideType = telephonyDisplayInfo.overrideNetworkType
             lastNetworkType = netType
             lastOverrideNetworkType = overrideType
-            emitSnapshot(netType, overrideType)
+
+            // Always refresh NR State from active TelephonyManager.serviceState so both
+            // upgrades (NOT_RESTRICTED -> CONNECTED) and downgrades (CONNECTED -> NOT_RESTRICTED)
+            // are reflected immediately even if onDisplayInfoChanged fires first.
+            val polledNrState = getSafeServiceStateNrState()
+            if (polledNrState != "NONE") {
+                lastNrState = polledNrState
+            } else if (!hasNsaOverride(overrideType) && netType != TelephonyManager.NETWORK_TYPE_NR) {
+                lastNrState = "NONE"
+            }
+
+            emitSnapshot(netType, overrideType, lastNrState)
+
+            if (lastNrState != "CONNECTED" &&
+                (hasNsaOverride(overrideType) || netType == TelephonyManager.NETWORK_TYPE_LTE)
+            ) {
+                probeNrStateViaShizukuIfNeeded(activeSimSlotIndex, activeSubscriptionId)
+            }
         }
 
         override fun onServiceStateChanged(serviceState: ServiceState) {
             val currentDataNetType = getSafeDataNetworkType()
-            // If data network drops to 3G/2G/non-LTE/non-NR, clear any stale 5G NSA override.
-            // If data network is LTE or NR, preserve lastOverrideNetworkType from DisplayInfoListener
-            // so ServiceStateListener never overwrites a valid NR_NSA override with NONE.
+            val extractedNrState = extractNrState(serviceState)
+
             val isCapableOfNsaOrNr = currentDataNetType == TelephonyManager.NETWORK_TYPE_LTE ||
                 currentDataNetType == TelephonyManager.NETWORK_TYPE_NR ||
                 currentDataNetType == TelephonyManager.NETWORK_TYPE_UNKNOWN
 
             if (!isCapableOfNsaOrNr) {
                 lastOverrideNetworkType = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NONE
+                lastNrState = "NONE"
+            } else {
+                lastNrState = extractedNrState
             }
 
-            if (!hasReceivedDisplayInfo) {
+            if (currentDataNetType != TelephonyManager.NETWORK_TYPE_UNKNOWN) {
                 lastNetworkType = currentDataNetType
-                // Wait for DisplayInfoListener if currently on LTE so we don't emit a false LTE-only
-                // snapshot milliseconds before DisplayInfoListener reports OVERRIDE_NETWORK_TYPE_NR_NSA.
-                if (currentDataNetType != TelephonyManager.NETWORK_TYPE_LTE) {
-                    emitSnapshot(currentDataNetType, lastOverrideNetworkType)
-                }
-            } else if (currentDataNetType != TelephonyManager.NETWORK_TYPE_UNKNOWN &&
-                currentDataNetType != lastNetworkType
-            ) {
-                lastNetworkType = currentDataNetType
-                emitSnapshot(lastNetworkType, lastOverrideNetworkType)
+            }
+
+            emitSnapshot(lastNetworkType, lastOverrideNetworkType, lastNrState)
+
+            if (isCapableOfNsaOrNr && lastNrState != "CONNECTED") {
+                probeNrStateViaShizukuIfNeeded(activeSimSlotIndex, activeSubscriptionId)
             }
         }
     }
 
     /**
-     * Starts listening for 5G NSA / LTE display info and service state changes.
+     * Starts listening for 5G NSA / LTE display info and service state changes
+     * exclusively on the specified [simSlotIndex] (0 = SIM 1, 1 = SIM 2).
+     *
      * @return true if permission was granted and callback registration succeeded.
      */
     @SuppressLint("MissingPermission")
-    fun start(): Boolean {
-        if (isRegistered) return true
-        val manager = telephonyManager ?: return false
+    fun start(simSlotIndex: Int = GatekeeperRepository.uiState.value.config.selectedSimSlot): Boolean {
+        if (isRegistered) {
+            stop()
+        }
+        val baseManager = baseTelephonyManager ?: return false
 
         val hasPermission = ContextCompat.checkSelfPermission(
             context,
@@ -110,12 +165,47 @@ class TelephonyNsaMonitor(
             return false
         }
 
+        val normalizedSlot = simSlotIndex.coerceIn(0, 1)
+        val sims = discoverSims(context)
+        val simInfo = sims.firstOrNull { it.slotIndex == normalizedSlot }
+        val resolvedSubId = resolveSubscriptionId(context, normalizedSlot, simInfo?.subscriptionId ?: -1)
+
+        val pinnedManager = if (resolvedSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID && resolvedSubId >= 0) {
+            baseManager.createForSubscriptionId(resolvedSubId)
+        } else {
+            baseManager
+        }
+
+        activeSimSlotIndex = normalizedSlot
+        activeSubscriptionId = resolvedSubId
+        activeTelephonyManager = pinnedManager
+
         return try {
             hasReceivedDisplayInfo = false
             lastNetworkType = getSafeDataNetworkType()
             lastOverrideNetworkType = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NONE
-            manager.registerTelephonyCallback(context.mainExecutor, telephonyCallback)
+            lastNrState = getSafeServiceStateNrState()
+
+            pinnedManager.registerTelephonyCallback(context.mainExecutor, telephonyCallback)
             isRegistered = true
+
+            val subLabel = if (resolvedSubId >= 0) "subId=$resolvedSubId" else "default-manager"
+            GatekeeperRepository.log(
+                LogLevel.INFO,
+                "Pinned TelephonyCallback exclusively to SIM ${normalizedSlot + 1} (${simInfo?.carrierName ?: "Unknown"}, $subLabel)"
+            )
+
+            // Emit initial snapshot on mainExecutor and start background verification loop
+            // so NR State transitions (NOT_RESTRICTED <-> CONNECTED) during bait pings are never missed.
+            context.mainExecutor.execute {
+                if (isRegistered && activeSimSlotIndex == normalizedSlot) {
+                    emitSnapshot(lastNetworkType, lastOverrideNetworkType, lastNrState)
+                    if (lastNrState != "CONNECTED") {
+                        probeNrStateViaShizukuIfNeeded(normalizedSlot, resolvedSubId)
+                    }
+                }
+            }
+            startPollingLoop(normalizedSlot, resolvedSubId)
             true
         } catch (_: SecurityException) {
             isRegistered = false
@@ -127,23 +217,63 @@ class TelephonyNsaMonitor(
     }
 
     /**
-     * Unregisters the [TelephonyCallback].
+     * Unregisters the [TelephonyCallback] from the active SIM's [TelephonyManager].
      */
     fun stop() {
+        pollingJob?.cancel()
+        pollingJob = null
         if (!isRegistered) return
         try {
-            telephonyManager?.unregisterTelephonyCallback(telephonyCallback)
+            (activeTelephonyManager ?: baseTelephonyManager)?.unregisterTelephonyCallback(telephonyCallback)
         } catch (_: Exception) {
             // Ignore unregister errors if service is tearing down
         } finally {
             isRegistered = false
             hasReceivedDisplayInfo = false
+            activeTelephonyManager = null
+        }
+    }
+
+    private fun startPollingLoop(simSlotIndex: Int, subscriptionId: Int) {
+        pollingJob?.cancel()
+        pollingJob = monitorScope.launch {
+            while (isActive && isRegistered && activeSimSlotIndex == simSlotIndex) {
+                delay(POLL_INTERVAL_MS)
+                if (!isRegistered || activeSimSlotIndex != simSlotIndex) break
+
+                val polledNetType = getSafeDataNetworkType()
+                val polledNrState = getSafeServiceStateNrState()
+
+                val netChanged = polledNetType != TelephonyManager.NETWORK_TYPE_UNKNOWN &&
+                    polledNetType != lastNetworkType
+                val nrChanged = polledNrState != "NONE" && polledNrState != lastNrState
+
+                if (netChanged || nrChanged) {
+                    if (polledNetType != TelephonyManager.NETWORK_TYPE_UNKNOWN) {
+                        lastNetworkType = polledNetType
+                    }
+                    if (polledNrState != "NONE") {
+                        lastNrState = polledNrState
+                    }
+                    context.mainExecutor.execute {
+                        if (isRegistered && activeSimSlotIndex == simSlotIndex) {
+                            emitSnapshot(lastNetworkType, lastOverrideNetworkType, lastNrState)
+                        }
+                    }
+                }
+
+                if (polledNrState == "NONE" &&
+                    (lastNrState != "CONNECTED" || hasNsaOverride(lastOverrideNetworkType) || lastNetworkType == TelephonyManager.NETWORK_TYPE_LTE)
+                ) {
+                    probeNrStateViaShizukuIfNeeded(simSlotIndex, subscriptionId)
+                }
+            }
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun getSafeDataNetworkType(): Int {
-        val manager = telephonyManager ?: return TelephonyManager.NETWORK_TYPE_UNKNOWN
+        val manager = activeTelephonyManager ?: baseTelephonyManager ?: return TelephonyManager.NETWORK_TYPE_UNKNOWN
         val hasPermission = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.READ_PHONE_STATE
@@ -159,8 +289,78 @@ class TelephonyNsaMonitor(
         }
     }
 
-    private fun emitSnapshot(networkType: Int, overrideNetworkType: Int) {
-        val snapshot = evaluateSnapshot(networkType, overrideNetworkType)
+    @SuppressLint("MissingPermission")
+    private fun getSafeServiceStateNrState(): String {
+        val manager = activeTelephonyManager ?: baseTelephonyManager ?: return "NONE"
+        val hasPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_PHONE_STATE
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasPermission) return "NONE"
+
+        return try {
+            extractNrState(manager.serviceState)
+        } catch (_: SecurityException) {
+            "NONE"
+        } catch (_: Exception) {
+            "NONE"
+        }
+    }
+
+    private fun probeNrStateViaShizukuIfNeeded(simSlotIndex: Int, subscriptionId: Int) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastShizukuProbeElapsedMs < SHIZUKU_PROBE_THROTTLE_MS) {
+            return
+        }
+        if (!ShizukuShellExecutor.isReady()) {
+            return
+        }
+        if (!isShizukuProbeInFlight.compareAndSet(false, true)) {
+            return
+        }
+        lastShizukuProbeElapsedMs = now
+
+        monitorScope.launch {
+            try {
+                val result = ShizukuShellExecutor.execute(
+                    command = "dumpsys telephony.registry",
+                    timeoutMs = 2500L
+                )
+                if (!result.isSuccess || result.stdout.isBlank()) return@launch
+
+                val unredactedNrState = extractNrStateFromDumpsysOrNull(
+                    dumpsysOutput = result.stdout,
+                    simSlotIndex = simSlotIndex,
+                    subscriptionId = subscriptionId
+                )
+                if (unredactedNrState != null &&
+                    unredactedNrState != lastNrState &&
+                    isRegistered &&
+                    activeSimSlotIndex == simSlotIndex
+                ) {
+                    lastNrState = unredactedNrState
+                    context.mainExecutor.execute {
+                        if (isRegistered && activeSimSlotIndex == simSlotIndex) {
+                            emitSnapshot(lastNetworkType, lastOverrideNetworkType, lastNrState)
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                // Ignore background probe errors
+            } finally {
+                isShizukuProbeInFlight.set(false)
+            }
+        }
+    }
+
+    private fun emitSnapshot(networkType: Int, overrideNetworkType: Int, nrState: String) {
+        val snapshot = evaluateSnapshot(
+            simSlotIndex = activeSimSlotIndex,
+            subscriptionId = activeSubscriptionId,
+            networkType = networkType,
+            overrideNetworkType = overrideNetworkType,
+            nrState = nrState
+        )
         onSnapshotChanged(snapshot)
     }
 
@@ -169,24 +369,283 @@ class TelephonyNsaMonitor(
         @Suppress("DEPRECATION")
         private const val OVERRIDE_NR_NSA_MMWAVE = TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA_MMWAVE
 
-        fun evaluateSnapshot(networkType: Int, overrideNetworkType: Int): CellularSignalSnapshot {
-            val hasNsaOverride =
-                overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA ||
-                    overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED ||
-                    overrideNetworkType == OVERRIDE_NR_NSA_MMWAVE
+        private const val SHIZUKU_PROBE_THROTTLE_MS = 1500L
+        private const val POLL_INTERVAL_MS = 1500L
 
-            val is5gNsaOrBetter =
-                networkType == TelephonyManager.NETWORK_TYPE_NR ||
-                    (hasNsaOverride && (
-                        networkType == TelephonyManager.NETWORK_TYPE_LTE ||
-                            networkType == TelephonyManager.NETWORK_TYPE_UNKNOWN
-                        ))
+        private val NR_STATE_REGEX = Regex(
+            """(?:mNrState|nrState|NR\s*State(?:\s*\(NSA\))?)\s*[=:]\s*([A-Za-z0-9_-]+)""",
+            RegexOption.IGNORE_CASE
+        )
 
+        /**
+         * Discovers SIM 1 (slot 0) and SIM 2 (slot 1) via [SubscriptionManager] and updates
+         * [GatekeeperRepository] with the available SIMs and active SIM label.
+         */
+        @SuppressLint("MissingPermission")
+        fun discoverSims(context: Context): List<SimSlotInfo> {
+            val hasPermission = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.READ_PHONE_STATE
+            ) == PackageManager.PERMISSION_GRANTED
+
+            val subManager = context.getSystemService(SubscriptionManager::class.java)
+            val defaultDataSubId = SubscriptionManager.getDefaultDataSubscriptionId()
+
+            val activeSubs = if (hasPermission && subManager != null) {
+                runCatching { subManager.activeSubscriptionInfoList.orEmpty() }.getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+
+            val simList = (0..1).map { slotIndex ->
+                val subInfo = activeSubs.firstOrNull { it.simSlotIndex == slotIndex }
+                val subId = subInfo?.subscriptionId
+                    ?: resolveSubscriptionId(context, slotIndex, -1)
+
+                val rawCarrier = subInfo?.carrierName?.toString()?.trim().orEmpty()
+                val rawDisplay = subInfo?.displayName?.toString()?.trim().orEmpty()
+                val carrierName = when {
+                    rawCarrier.isNotEmpty() -> rawCarrier
+                    rawDisplay.isNotEmpty() -> rawDisplay
+                    hasPermission -> "No SIM"
+                    else -> "Slot ${slotIndex + 1}"
+                }
+
+                val isActiveData = subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID &&
+                    subId >= 0 &&
+                    defaultDataSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID &&
+                    subId == defaultDataSubId
+
+                SimSlotInfo(
+                    slotIndex = slotIndex,
+                    subscriptionId = if (subId >= 0) subId else -1,
+                    displayName = "SIM ${slotIndex + 1}",
+                    carrierName = carrierName,
+                    isActiveDataSim = isActiveData
+                )
+            }
+
+            GatekeeperRepository.updateState { current ->
+                val selectedSlot = current.config.selectedSimSlot.coerceIn(0, 1)
+                val selectedSim = simList.firstOrNull { it.slotIndex == selectedSlot } ?: simList.first()
+                val label = if (selectedSim.carrierName.isNotBlank() &&
+                    selectedSim.carrierName != "No SIM" &&
+                    !selectedSim.carrierName.startsWith("Slot")
+                ) {
+                    "${selectedSim.displayName} (${selectedSim.carrierName})"
+                } else {
+                    selectedSim.displayName
+                }
+                current.copy(
+                    availableSims = simList,
+                    activeSimLabel = label
+                )
+            }
+
+            return simList
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun resolveSubscriptionId(context: Context, slotIndex: Int, knownSubId: Int): Int {
+            if (knownSubId >= 0 && knownSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                return knownSubId
+            }
+            return try {
+                val subManager = context.getSystemService(SubscriptionManager::class.java)
+                val subInfo = subManager?.getActiveSubscriptionInfoForSimSlotIndex(slotIndex)
+                if (subInfo != null && subInfo.subscriptionId >= 0) {
+                    return subInfo.subscriptionId
+                }
+                @Suppress("DEPRECATION")
+                val subIds = subManager?.getSubscriptionIds(slotIndex)
+                val firstId = subIds?.firstOrNull() ?: SubscriptionManager.INVALID_SUBSCRIPTION_ID
+                if (firstId >= 0) firstId else SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            } catch (_: Throwable) {
+                SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            }
+        }
+
+        /**
+         * Extracts the highest-ranked 5G NSA `nrState` across all registration entries in [ServiceState].
+         *
+         * Why highest-ranked: A phone has multiple `NetworkRegistrationInfo` entries (CS voice domain
+         * and PS WWAN data domain). CS domain always reports `nrState=NONE`, whereas PS WWAN reports
+         * `nrState=CONNECTED` when attached to a 5G NSA secondary cell.
+         */
+        fun extractNrState(serviceState: ServiceState?): String {
+            if (serviceState == null) return "NONE"
+            var bestState = "NONE"
+
+            try {
+                val regList = serviceState.networkRegistrationInfoList
+                for (regInfo in regList) {
+                    if (regInfo == null) continue
+
+                    // 1. Try invoking getNrState() directly if accessible via reflection
+                    val reflectedInt = runCatching {
+                        regInfo.javaClass.getMethod("getNrState").invoke(regInfo) as? Int
+                    }.getOrNull()
+
+                    if (reflectedInt != null) {
+                        val candidate = nrStateIntToString(reflectedInt)
+                        if (nrStateRank(candidate) > nrStateRank(bestState)) {
+                            bestState = candidate
+                        }
+                    }
+
+                    // 2. Also inspect NetworkRegistrationInfo.toString()
+                    val fromRegString = extractNrStateFromText(regInfo.toString())
+                    if (nrStateRank(fromRegString) > nrStateRank(bestState)) {
+                        bestState = fromRegString
+                    }
+                }
+            } catch (_: Throwable) {
+                // Fall back to ServiceState.toString() parsing below
+            }
+
+            // 3. Also inspect ServiceState.toString() across all registration records
+            val fromServiceStateText = extractNrStateFromText(serviceState.toString())
+            if (nrStateRank(fromServiceStateText) > nrStateRank(bestState)) {
+                bestState = fromServiceStateText
+            }
+
+            return bestState
+        }
+
+        /**
+         * Parses `ServiceState.toString()` or `NetworkRegistrationInfo.toString()` text and returns
+         * the highest-ranked `nrState` (`CONNECTED` > `NOT_RESTRICTED` > `RESTRICTED` > `NONE`).
+         */
+        fun extractNrStateFromText(rawText: String?): String =
+            extractNrStateFromTextOrNull(rawText) ?: "NONE"
+
+        private fun extractNrStateFromTextOrNull(rawText: String?): String? {
+            if (rawText.isNullOrBlank()) return null
+            var foundAny = false
+            var bestState = "NONE"
+
+            for (match in NR_STATE_REGEX.findAll(rawText)) {
+                foundAny = true
+                val rawValue = match.groupValues.getOrNull(1).orEmpty()
+                val normalized = normalizeNrState(rawValue)
+                if (nrStateRank(normalized) > nrStateRank(bestState)) {
+                    bestState = normalized
+                }
+            }
+            return if (foundAny) bestState else null
+        }
+
+        /**
+         * Extracts the unredacted `nrState` for a specific [simSlotIndex] from `dumpsys telephony.registry`.
+         */
+        fun extractNrStateFromDumpsys(
+            dumpsysOutput: String,
+            simSlotIndex: Int,
+            subscriptionId: Int = -1
+        ): String = extractNrStateFromDumpsysOrNull(dumpsysOutput, simSlotIndex, subscriptionId) ?: "NONE"
+
+        fun extractNrStateFromDumpsysOrNull(
+            dumpsysOutput: String,
+            simSlotIndex: Int,
+            subscriptionId: Int = -1
+        ): String? {
+            if (dumpsysOutput.isBlank()) return null
+
+            // Locate "Phone Id=<simSlotIndex>" section in dumpsys telephony.registry
+            val phoneMarker = Regex("""Phone\s+Id\s*=\s*$simSlotIndex\b""", RegexOption.IGNORE_CASE)
+            val anyPhoneMarker = Regex("""Phone\s+Id\s*=\s*\d+\b""", RegexOption.IGNORE_CASE)
+
+            val startMatch = phoneMarker.find(dumpsysOutput)
+            if (startMatch != null) {
+                val sectionStart = startMatch.range.first
+                val nextMatch = anyPhoneMarker.find(dumpsysOutput, startMatch.range.last + 1)
+                val sectionEnd = nextMatch?.range?.first ?: dumpsysOutput.length
+                val slotSection = dumpsysOutput.substring(sectionStart, sectionEnd)
+                val slotNrState = extractNrStateFromTextOrNull(slotSection)
+                if (slotNrState != null) {
+                    return slotNrState
+                }
+            }
+
+            if (subscriptionId >= 0) {
+                val subLineMatch = dumpsysOutput.lineSequence()
+                    .filter { it.contains("mServiceState", ignoreCase = true) && it.contains("$subscriptionId") }
+                    .joinToString("\n")
+                val subNrState = extractNrStateFromTextOrNull(subLineMatch)
+                if (subNrState != null) {
+                    return subNrState
+                }
+            }
+
+            // Only fall back to scanning the full output if no "Phone Id=" sections exist at all
+            if (anyPhoneMarker.find(dumpsysOutput) == null) {
+                return extractNrStateFromTextOrNull(dumpsysOutput)
+            }
+            return null
+        }
+
+        fun normalizeNrState(raw: String?): String {
+            val cleaned = raw?.trim()?.uppercase()?.removeSuffix(",")?.removeSuffix("}") ?: return "NONE"
+            return when (cleaned) {
+                "3", "CONNECTED", "NR_STATE_CONNECTED" -> "CONNECTED"
+                "2", "NOT_RESTRICTED", "NR_STATE_NOT_RESTRICTED" -> "NOT_RESTRICTED"
+                "1", "RESTRICTED", "NR_STATE_RESTRICTED" -> "RESTRICTED"
+                "0", "-1", "NONE", "NR_STATE_NONE", "" -> "NONE"
+                else -> "NONE"
+            }
+        }
+
+        private fun nrStateIntToString(value: Int): String = when (value) {
+            3 -> "CONNECTED"
+            2 -> "NOT_RESTRICTED"
+            1 -> "RESTRICTED"
+            else -> "NONE"
+        }
+
+        private fun nrStateRank(state: String): Int = when (normalizeNrState(state)) {
+            "CONNECTED" -> 3
+            "NOT_RESTRICTED" -> 2
+            "RESTRICTED" -> 1
+            else -> 0
+        }
+
+        fun hasNsaOverride(overrideNetworkType: Int): Boolean =
+            overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA ||
+                overrideNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED ||
+                overrideNetworkType == OVERRIDE_NR_NSA_MMWAVE
+
+        /**
+         * Strictly evaluates whether the cellular radio is truly attached to 5G:
+         * - 5G SA (`NETWORK_TYPE_NR`), OR
+         * - 5G NSA with `NR State (NSA) == CONNECTED` (`normalizedNrState == "CONNECTED"`).
+         *
+         * Even if `overrideNetworkType == OVERRIDE_NETWORK_TYPE_NR_NSA` (5G icon shown by carrier),
+         * if `nrState != "CONNECTED"` (e.g. `NOT_RESTRICTED` or `NONE`), `is5gNsaOrBetter` is `false`
+         * so traffic remains blocked and the Bait Heartbeat continues until `NR State` becomes `CONNECTED`.
+         */
+        fun evaluateSnapshot(
+            simSlotIndex: Int = 0,
+            subscriptionId: Int = -1,
+            networkType: Int,
+            overrideNetworkType: Int,
+            nrState: String = "NONE"
+        ): CellularSignalSnapshot {
+            val normalizedNrState = normalizeNrState(nrState)
+            val is5gSa = networkType == TelephonyManager.NETWORK_TYPE_NR
+            val isNrNsaConnected = normalizedNrState == "CONNECTED" && (
+                networkType == TelephonyManager.NETWORK_TYPE_LTE ||
+                    networkType == TelephonyManager.NETWORK_TYPE_NR ||
+                    networkType == TelephonyManager.NETWORK_TYPE_UNKNOWN
+                )
+            val is5gNsaOrBetter = is5gSa || isNrNsaConnected
             val isLteOnly = !is5gNsaOrBetter
 
             return CellularSignalSnapshot(
+                simSlotIndex = simSlotIndex,
+                subscriptionId = subscriptionId,
                 networkType = networkType,
                 overrideNetworkType = overrideNetworkType,
+                nrState = normalizedNrState,
                 networkTypeName = networkTypeToName(networkType),
                 overrideTypeName = overrideTypeToName(overrideNetworkType),
                 is5gNsaOrBetter = is5gNsaOrBetter,

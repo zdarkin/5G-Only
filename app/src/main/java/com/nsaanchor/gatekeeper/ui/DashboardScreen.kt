@@ -15,15 +15,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,7 +32,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.DeleteSweep
@@ -48,7 +44,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.SimCard
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -97,6 +93,7 @@ import com.nsaanchor.gatekeeper.model.LogEntry
 import com.nsaanchor.gatekeeper.model.LogLevel
 import com.nsaanchor.gatekeeper.model.NetworkAnchorState
 import com.nsaanchor.gatekeeper.model.ShizukuStatus
+import com.nsaanchor.gatekeeper.model.SimSlotInfo
 import com.nsaanchor.gatekeeper.ui.theme.AmberWarning
 import com.nsaanchor.gatekeeper.ui.theme.AmberWarningDim
 import com.nsaanchor.gatekeeper.ui.theme.CrimsonRed
@@ -133,6 +130,7 @@ fun DashboardScreen(
         onRefreshShizuku = { viewModel.refreshShizuku() },
         onRequestShizukuPermission = { viewModel.requestShizukuPermission() },
         onRequestAndroidPermissions = onRequestPermissions,
+        onSelectSimSlot = { slotIndex -> viewModel.selectSimSlot(context, slotIndex) },
         onUpdateHeartbeatIp = { viewModel.updateHeartbeatIp(it) },
         onUpdateGracePeriodMs = { viewModel.updateGracePeriodMs(it) },
         onUpdateHeartbeatIntervalMs = { viewModel.updateHeartbeatIntervalMs(it) },
@@ -151,6 +149,7 @@ fun DashboardContent(
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
     onRequestAndroidPermissions: () -> Unit,
+    onSelectSimSlot: (Int) -> Unit,
     onUpdateHeartbeatIp: (String) -> Unit,
     onUpdateGracePeriodMs: (Long) -> Unit,
     onUpdateHeartbeatIntervalMs: (Long) -> Unit,
@@ -159,6 +158,10 @@ fun DashboardContent(
     onClearLogs: () -> Unit
 ) {
     val scrollState = rememberScrollState()
+    val isShizukuReady =
+        uiState.shizukuStatus == ShizukuStatus.READY_SHELL ||
+            uiState.shizukuStatus == ShizukuStatus.READY_ROOT
+    val isSetupComplete = isShizukuReady && hasTelephonyPermissions
 
     Scaffold(
         containerColor = DeepSlateBackground
@@ -168,31 +171,44 @@ fun DashboardContent(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .verticalScroll(scrollState)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            TopHeaderBar(isServiceRunning = uiState.isServiceRunning)
-
-            LiveStatusHeroCard(uiState = uiState)
-
-            ServiceControlCard(
+            // 1. Compact Header Row
+            CompactHeaderRow(
                 isServiceRunning = uiState.isServiceRunning,
-                isFirewallActive = uiState.isFirewallActive,
+                isSetupComplete = isSetupComplete,
+                shizukuStatus = uiState.shizukuStatus
+            )
+
+            // 2. Auto-Hiding Setup Banner (only shown when setup is incomplete)
+            if (!isSetupComplete) {
+                SetupBannerCard(
+                    shizukuStatus = uiState.shizukuStatus,
+                    shizukuUid = uiState.shizukuUid,
+                    hasTelephonyPermissions = hasTelephonyPermissions,
+                    onRefreshShizuku = onRefreshShizuku,
+                    onRequestShizukuPermission = onRequestShizukuPermission,
+                    onRequestAndroidPermissions = onRequestAndroidPermissions
+                )
+            }
+
+            // 3. Clean SIM Selector Bar (Target SIM for Hotspot)
+            SimSelectorBar(
+                availableSims = uiState.availableSims,
+                selectedSimSlot = uiState.config.selectedSimSlot,
+                onSelectSimSlot = onSelectSimSlot
+            )
+
+            // 4. Unified Status & Control Hero Card
+            UnifiedStatusControlCard(
+                uiState = uiState,
                 onToggleService = onToggleService,
                 onForceFlushFirewall = onForceFlushFirewall
             )
 
-            PermissionsAndShizukuCard(
-                shizukuStatus = uiState.shizukuStatus,
-                shizukuUid = uiState.shizukuUid,
-                hasTelephonyPermissions = hasTelephonyPermissions,
-                detectedInterfaces = uiState.detectedInterfaces,
-                onRefreshShizuku = onRefreshShizuku,
-                onRequestShizukuPermission = onRequestShizukuPermission,
-                onRequestAndroidPermissions = onRequestAndroidPermissions
-            )
-
-            ConfigurationCard(
+            // 5. Settings Card (Collapsed by default!)
+            SettingsCard(
                 uiState = uiState,
                 onUpdateHeartbeatIp = onUpdateHeartbeatIp,
                 onUpdateGracePeriodMs = onUpdateGracePeriodMs,
@@ -201,6 +217,7 @@ fun DashboardContent(
                 onUpdateCustomInterfaces = onUpdateCustomInterfaces
             )
 
+            // 6. Live Log Card
             TerminalLogCard(
                 logs = uiState.logs,
                 onClearLogs = onClearLogs
@@ -210,322 +227,79 @@ fun DashboardContent(
 }
 
 @Composable
-private fun TopHeaderBar(isServiceRunning: Boolean) {
+private fun CompactHeaderRow(
+    isServiceRunning: Boolean,
+    isSetupComplete: Boolean,
+    shizukuStatus: ShizukuStatus
+) {
+    val pillColor = when {
+        isSetupComplete -> EmeraldGreen
+        shizukuStatus == ShizukuStatus.NOT_RUNNING || shizukuStatus == ShizukuStatus.ERROR -> CrimsonRed
+        else -> AmberWarning
+    }
+    val pillBg = when {
+        isSetupComplete -> EmeraldGreenDim.copy(alpha = 0.55f)
+        shizukuStatus == ShizukuStatus.NOT_RUNNING || shizukuStatus == ShizukuStatus.ERROR -> CrimsonRedDim.copy(alpha = 0.55f)
+        else -> AmberWarningDim.copy(alpha = 0.55f)
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp),
+            .padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                    .size(38.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background( if (isServiceRunning) EmeraldGreenDim else SlateCardElevated )
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (isServiceRunning) EmeraldGreenDim else SlateCardElevated)
                     .border(
                         width = 1.dp,
                         color = if (isServiceRunning) EmeraldGreen else SlateBorder,
-                        shape = RoundedCornerShape(10.dp)
+                        shape = RoundedCornerShape(8.dp)
                     ),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.CellTower,
-                    contentDescription = "5G Anchor",
+                    contentDescription = "5G NSA Gatekeeper",
                     tint = if (isServiceRunning) EmeraldGreen else CyanAccent,
-                    modifier = Modifier.size(22.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
-            Spacer(modifier = Modifier.width(12.dp))
-            Column {
-                Text(
-                    text = "5G NSA ANCHOR & GATEKEEPER",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = TextPrimary,
-                    fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = 0.6.sp
-                )
-                Text(
-                    text = "EN-DC Heartbeat Bait + Shizuku iptables Firewall",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextSecondary,
-                    fontSize = 11.sp
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun LiveStatusHeroCard(uiState: GatekeeperUiState) {
-    val accentColor by animateColorAsState(
-        targetValue = when (uiState.anchorState) {
-            NetworkAnchorState.CONNECTED_5G_NSA -> EmeraldGreen
-            NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> CrimsonRed
-            NetworkAnchorState.HANDOVER_GRACE_PERIOD,
-            NetworkAnchorState.STARTING_FAIL_CLOSED -> AmberWarning
-            NetworkAnchorState.ERROR -> CrimsonRed
-            NetworkAnchorState.STOPPED -> TextMuted
-        },
-        animationSpec = tween(350),
-        label = "HeroAccentColor"
-    )
-
-    val containerBg by animateColorAsState(
-        targetValue = when (uiState.anchorState) {
-            NetworkAnchorState.CONNECTED_5G_NSA -> EmeraldGreenDim.copy(alpha = 0.28f)
-            NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> CrimsonRedDim.copy(alpha = 0.30f)
-            NetworkAnchorState.HANDOVER_GRACE_PERIOD,
-            NetworkAnchorState.STARTING_FAIL_CLOSED -> AmberWarningDim.copy(alpha = 0.28f)
-            NetworkAnchorState.ERROR -> CrimsonRedDim.copy(alpha = 0.25f)
-            NetworkAnchorState.STOPPED -> SlateCardSurface
-        },
-        animationSpec = tween(350),
-        label = "HeroContainerBg"
-    )
-
-    val infiniteTransition = rememberInfiniteTransition(label = "PulseTransition")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.9f,
-        targetValue = 1.25f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(900, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "PulseScale"
-    )
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = containerBg),
-        border = BorderStroke(1.5.dp, accentColor.copy(alpha = 0.7f))
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(22.dp)) {
-                        if (uiState.isServiceRunning) {
-                            Box(
-                                modifier = Modifier
-                                    .size(16.dp)
-                                    .scale(pulseScale)
-                                    .clip(CircleShape)
-                                    .background(accentColor.copy(alpha = 0.35f))
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .size(10.dp)
-                                .clip(CircleShape)
-                                .background(accentColor)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = uiState.anchorState.displayTitle,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = accentColor,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.1.sp
-                    )
-                }
-
-                // Firewall Lockdown Pill
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (uiState.isFirewallActive) CrimsonRedDim else EmeraldGreenDim.copy(alpha = 0.6f),
-                    border = BorderStroke(
-                        1.dp,
-                        if (uiState.isFirewallActive) CrimsonRed else EmeraldGreen
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = if (uiState.isFirewallActive) Icons.Default.Lock else Icons.Default.GppGood,
-                            contentDescription = null,
-                            tint = if (uiState.isFirewallActive) CrimsonRed else EmeraldGreen,
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = if (uiState.isFirewallActive) "NSA_LOCKDOWN ACTIVE" else "UNBLOCKED",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (uiState.isFirewallActive) Color(0xFFFECACA) else Color(0xFFA7F3D0),
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-
-            // Prominent Required State Headline
+            Spacer(modifier = Modifier.width(10.dp))
             Text(
-                text = uiState.anchorState.statusSummary,
-                style = MaterialTheme.typography.headlineMedium,
+                text = "5G NSA Gatekeeper",
+                style = MaterialTheme.typography.titleLarge,
                 color = TextPrimary,
-                fontSize = 19.sp
-            )
-
-            if (uiState.anchorState == NetworkAnchorState.HANDOVER_GRACE_PERIOD && uiState.graceRemainingMs > 0) {
-                Text(
-                    text = String.format(
-                        Locale.US,
-                        "Grace countdown: %.1fs remaining before iptables lockdown",
-                        uiState.graceRemainingMs / 1000f
-                    ),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = AmberWarning,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-
-            HorizontalDivider(color = SlateBorder.copy(alpha = 0.6f))
-
-            // Telemetry Badges Row
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                TelemetryBadge(
-                    label = "RAW NET",
-                    value = uiState.rawNetworkType,
-                    accent = CyanAccent
-                )
-                TelemetryBadge(
-                    label = "OVERRIDE",
-                    value = uiState.overrideNetworkType,
-                    accent = if (uiState.overrideNetworkType.startsWith("NR_")) EmeraldGreen else AmberWarning
-                )
-                TelemetryBadge(
-                    label = "EN-DC BAIT",
-                    value = "Sent: ${uiState.heartbeatCount} | Last: ${uiState.lastHeartbeatStatus}",
-                    accent = CyanAccent
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TelemetryBadge(
-    label: String,
-    value: String,
-    accent: Color
-) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = SlateCardElevated.copy(alpha = 0.85f),
-        border = BorderStroke(1.dp, SlateBorder)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "$label: ",
-                style = MaterialTheme.typography.labelMedium,
-                color = TextSecondary
-            )
-            Text(
-                text = value,
-                style = MaterialTheme.typography.labelMedium,
-                color = accent,
                 fontWeight = FontWeight.Bold
             )
         }
-    }
-}
 
-@Composable
-private fun ServiceControlCard(
-    isServiceRunning: Boolean,
-    isFirewallActive: Boolean,
-    onToggleService: () -> Unit,
-    onForceFlushFirewall: () -> Unit
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = SlateCardSurface),
-        border = BorderStroke(1.dp, SlateBorder)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = pillBg,
+            border = BorderStroke(1.dp, pillColor.copy(alpha = 0.8f))
         ) {
-            Button(
-                onClick = onToggleService,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isServiceRunning) CrimsonRed else EmeraldGreen,
-                    contentColor = if (isServiceRunning) TextPrimary else Color(0xFF022C22)
-                )
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    imageVector = if (isServiceRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
+                    imageVector = if (isSetupComplete) Icons.Default.VerifiedUser else Icons.Default.Warning,
                     contentDescription = null,
-                    modifier = Modifier.size(22.dp)
+                    tint = pillColor,
+                    modifier = Modifier.size(13.dp)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(5.dp))
                 Text(
-                    text = if (isServiceRunning) {
-                        "Stop Service & Unblock All"
-                    } else {
-                        "Start 5G Anchor & Gatekeeper"
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            OutlinedButton(
-                onClick = onForceFlushFirewall,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(42.dp),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    1.dp,
-                    if (isFirewallActive) AmberWarning else SlateBorder
-                ),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = if (isFirewallActive) AmberWarning else TextSecondary
-                )
-            ) {
-                Icon(
-                    imageVector = Icons.Default.CleaningServices,
-                    contentDescription = null,
-                    modifier = Modifier.size(17.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Emergency Flush iptables / ip6tables (NSA_LOCKDOWN)",
+                    text = if (isSetupComplete) "Shizuku Ready" else "Setup Needed",
                     style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold
+                    color = pillColor,
+                    fontWeight = FontWeight.Bold
                 )
             }
         }
@@ -533,16 +307,16 @@ private fun ServiceControlCard(
 }
 
 @Composable
-private fun PermissionsAndShizukuCard(
+private fun SetupBannerCard(
     shizukuStatus: ShizukuStatus,
     shizukuUid: Int,
     hasTelephonyPermissions: Boolean,
-    detectedInterfaces: List<String>,
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
     onRequestAndroidPermissions: () -> Unit
 ) {
-    val isShizukuReady = shizukuStatus == ShizukuStatus.READY_SHELL || shizukuStatus == ShizukuStatus.READY_ROOT
+    val isShizukuReady =
+        shizukuStatus == ShizukuStatus.READY_SHELL || shizukuStatus == ShizukuStatus.READY_ROOT
     val shizukuColor = when (shizukuStatus) {
         ShizukuStatus.READY_ROOT, ShizukuStatus.READY_SHELL -> EmeraldGreen
         ShizukuStatus.PERMISSION_REQUIRED -> AmberWarning
@@ -551,15 +325,15 @@ private fun PermissionsAndShizukuCard(
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = SlateCardSurface),
-        border = BorderStroke(1.dp, SlateBorder)
+        border = BorderStroke(1.dp, AmberWarning.copy(alpha = 0.6f))
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -570,27 +344,27 @@ private fun PermissionsAndShizukuCard(
                     Icon(
                         imageVector = Icons.Default.Security,
                         contentDescription = null,
-                        tint = CyanAccent,
-                        modifier = Modifier.size(18.dp)
+                        tint = AmberWarning,
+                        modifier = Modifier.size(16.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "SHIZUKU & PERMISSIONS",
+                        text = "Setup Required",
                         style = MaterialTheme.typography.titleMedium,
                         color = TextPrimary,
-                        fontSize = 14.sp
+                        fontSize = 13.sp
                     )
                 }
 
                 IconButton(
                     onClick = onRefreshShizuku,
-                    modifier = Modifier.size(28.dp)
+                    modifier = Modifier.size(24.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
                         contentDescription = "Refresh Shizuku",
                         tint = CyanAccent,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
@@ -609,24 +383,20 @@ private fun PermissionsAndShizukuCard(
                         imageVector = if (isShizukuReady) Icons.Default.VerifiedUser else Icons.Default.Warning,
                         contentDescription = null,
                         tint = shizukuColor,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(15.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = "Shizuku: ${shizukuStatus.label}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = shizukuColor,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        if (shizukuUid >= 0) {
-                            Text(
-                                text = "Privileged Binder UID: $shizukuUid",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = TextSecondary
-                            )
-                        }
-                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (shizukuUid >= 0) {
+                            "Shizuku: ${shizukuStatus.label} (UID $shizukuUid)"
+                        } else {
+                            "Shizuku: ${shizukuStatus.label}"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = shizukuColor,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 12.sp
+                    )
                 }
 
                 if (!isShizukuReady) {
@@ -636,12 +406,12 @@ private fun PermissionsAndShizukuCard(
                         } else {
                             onRefreshShizuku
                         },
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        modifier = Modifier.height(32.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        modifier = Modifier.height(28.dp),
                         border = BorderStroke(1.dp, shizukuColor)
                     ) {
                         Text(
-                            text = if (shizukuStatus == ShizukuStatus.PERMISSION_REQUIRED) "Grant Shizuku" else "Retry",
+                            text = if (shizukuStatus == ShizukuStatus.PERMISSION_REQUIRED) "Grant" else "Retry",
                             style = MaterialTheme.typography.labelMedium,
                             color = shizukuColor
                         )
@@ -663,60 +433,416 @@ private fun PermissionsAndShizukuCard(
                         imageVector = if (hasTelephonyPermissions) Icons.Default.GppGood else Icons.Default.GppBad,
                         contentDescription = null,
                         tint = if (hasTelephonyPermissions) EmeraldGreen else AmberWarning,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(15.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = if (hasTelephonyPermissions) {
-                            "Phone State & Fine Location: Granted"
+                            "Phone & Location: Granted"
                         } else {
-                            "Phone State & Fine Location: Required for 5G NSA"
+                            "Phone & Location: Needed for 5G NSA"
                         },
                         style = MaterialTheme.typography.bodyMedium,
-                        color = if (hasTelephonyPermissions) TextPrimary else AmberWarning
+                        color = if (hasTelephonyPermissions) TextPrimary else AmberWarning,
+                        fontSize = 12.sp
                     )
                 }
 
                 if (!hasTelephonyPermissions) {
                     OutlinedButton(
                         onClick = onRequestAndroidPermissions,
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        modifier = Modifier.height(32.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        modifier = Modifier.height(28.dp),
                         border = BorderStroke(1.dp, AmberWarning)
                     ) {
                         Text(
-                            text = "Grant Permissions",
+                            text = "Grant",
                             style = MaterialTheme.typography.labelMedium,
                             color = AmberWarning
                         )
                     }
                 }
             }
+        }
+    }
+}
 
-            // Detected Cellular Interfaces
+@Composable
+private fun SimSelectorBar(
+    availableSims: List<SimSlotInfo>,
+    selectedSimSlot: Int,
+    onSelectSimSlot: (Int) -> Unit
+) {
+    val sim1 = availableSims.find { it.slotIndex == 0 }
+        ?: SimSlotInfo(slotIndex = 0, subscriptionId = -1, displayName = "SIM 1", carrierName = "Slot 1")
+    val sim2 = availableSims.find { it.slotIndex == 1 }
+        ?: SimSlotInfo(slotIndex = 1, subscriptionId = -1, displayName = "SIM 2", carrierName = "Slot 2")
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = SlateCardSurface),
+        border = BorderStroke(1.dp, SlateBorder)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.Shield,
+                    imageVector = Icons.Default.SimCard,
                     contentDescription = null,
                     tint = CyanAccent,
                     modifier = Modifier.size(15.dp)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Target Cellular Interfaces: ${detectedInterfaces.joinToString(", ")}",
+                    text = "Target SIM for Hotspot",
                     style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary
+                    color = TextSecondary,
+                    fontWeight = FontWeight.SemiBold
                 )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(sim1, sim2).forEach { sim ->
+                    val isSelected = selectedSimSlot == sim.slotIndex
+                    val pillBorderColor = if (isSelected) CyanAccent else SlateBorder
+                    val pillBgColor = if (isSelected) CyanAccentDim.copy(alpha = 0.55f) else SlateCardElevated
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onSelectSimSlot(sim.slotIndex) },
+                        shape = RoundedCornerShape(10.dp),
+                        color = pillBgColor,
+                        border = BorderStroke(if (isSelected) 1.5.dp else 1.dp, pillBorderColor)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "SIM ${sim.slotIndex + 1} • ${sim.carrierName}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (isSelected) TextPrimary else TextSecondary,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+
+                            if (sim.isActiveDataSim) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(4.dp),
+                                    color = EmeraldGreenDim,
+                                    border = BorderStroke(0.8.dp, EmeraldGreen)
+                                ) {
+                                    Text(
+                                        text = "DATA",
+                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = EmeraldGreen,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 9.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun ConfigurationCard(
+private fun UnifiedStatusControlCard(
+    uiState: GatekeeperUiState,
+    onToggleService: () -> Unit,
+    onForceFlushFirewall: () -> Unit
+) {
+    val accentColor by animateColorAsState(
+        targetValue = when (uiState.anchorState) {
+            NetworkAnchorState.CONNECTED_5G_NSA -> EmeraldGreen
+            NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> CrimsonRed
+            NetworkAnchorState.HANDOVER_GRACE_PERIOD,
+            NetworkAnchorState.STARTING_FAIL_CLOSED -> AmberWarning
+            NetworkAnchorState.ERROR -> CrimsonRed
+            NetworkAnchorState.STOPPED -> TextMuted
+        },
+        animationSpec = tween(300),
+        label = "HeroAccentColor"
+    )
+
+    val containerBg by animateColorAsState(
+        targetValue = when (uiState.anchorState) {
+            NetworkAnchorState.CONNECTED_5G_NSA -> EmeraldGreenDim.copy(alpha = 0.24f)
+            NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> CrimsonRedDim.copy(alpha = 0.26f)
+            NetworkAnchorState.HANDOVER_GRACE_PERIOD,
+            NetworkAnchorState.STARTING_FAIL_CLOSED -> AmberWarningDim.copy(alpha = 0.24f)
+            NetworkAnchorState.ERROR -> CrimsonRedDim.copy(alpha = 0.22f)
+            NetworkAnchorState.STOPPED -> SlateCardSurface
+        },
+        animationSpec = tween(300),
+        label = "HeroContainerBg"
+    )
+
+    val stateTitle = when (uiState.anchorState) {
+        NetworkAnchorState.CONNECTED_5G_NSA -> "5G NSA Connected"
+        NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> "LTE — Blocking & Searching"
+        NetworkAnchorState.HANDOVER_GRACE_PERIOD -> {
+            if (uiState.graceRemainingMs > 0L) {
+                String.format(Locale.US, "Grace Period (%.1fs)", uiState.graceRemainingMs / 1000f)
+            } else {
+                "Grace Period"
+            }
+        }
+        NetworkAnchorState.STARTING_FAIL_CLOSED -> "Starting (Fail-Closed)"
+        NetworkAnchorState.ERROR -> "Error (Check Setup)"
+        NetworkAnchorState.STOPPED -> "Stopped"
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "PulseTransition")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.25f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "PulseScale"
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = containerBg),
+        border = BorderStroke(1.5.dp, accentColor.copy(alpha = 0.7f))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Top Row: Status dot + State title + Firewall pill ("LOCKED" vs "OPEN")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(20.dp)) {
+                        if (uiState.isServiceRunning) {
+                            Box(
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .scale(pulseScale)
+                                    .clip(CircleShape)
+                                    .background(accentColor.copy(alpha = 0.35f))
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(accentColor)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stateTitle,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = if (uiState.anchorState == NetworkAnchorState.STOPPED) TextSecondary else accentColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 17.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                // Firewall Pill ("LOCKED" vs "OPEN")
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (uiState.isFirewallActive) CrimsonRedDim else EmeraldGreenDim.copy(alpha = 0.6f),
+                    border = BorderStroke(
+                        1.dp,
+                        if (uiState.isFirewallActive) CrimsonRed else EmeraldGreen
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = if (uiState.isFirewallActive) Icons.Default.Lock else Icons.Default.GppGood,
+                            contentDescription = null,
+                            tint = if (uiState.isFirewallActive) CrimsonRed else EmeraldGreen,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (uiState.isFirewallActive) "LOCKED" else "OPEN",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (uiState.isFirewallActive) Color(0xFFFECACA) else Color(0xFFA7F3D0),
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // Middle Row: Clean 3-column metric boxes
+            val nrStateColor = when (uiState.nrState) {
+                "CONNECTED" -> EmeraldGreen
+                "NOT_RESTRICTED", "RESTRICTED" -> AmberWarning
+                else -> if (uiState.isServiceRunning) CrimsonRed else TextMuted
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MetricBox(
+                    modifier = Modifier.weight(1f),
+                    label = "NR State (NSA)",
+                    value = uiState.nrState,
+                    valueColor = nrStateColor
+                )
+                MetricBox(
+                    modifier = Modifier.weight(1f),
+                    label = "Network",
+                    value = "${uiState.rawNetworkType} (${uiState.overrideNetworkType})",
+                    valueColor = CyanAccent
+                )
+                MetricBox(
+                    modifier = Modifier.weight(0.75f),
+                    label = "Bait Pings",
+                    value = "${uiState.heartbeatCount}",
+                    valueColor = TextPrimary
+                )
+            }
+
+            // Bottom Row: Primary Start / Stop button + compact Flush button beside it
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onToggleService,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (uiState.isServiceRunning) CrimsonRed else EmeraldGreen,
+                        contentColor = if (uiState.isServiceRunning) TextPrimary else Color(0xFF022C22)
+                    )
+                ) {
+                    Icon(
+                        imageVector = if (uiState.isServiceRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (uiState.isServiceRunning) "Stop & Unblock" else "Start Gatekeeper",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onForceFlushFirewall,
+                    modifier = Modifier.height(46.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (uiState.isFirewallActive) AmberWarning else SlateBorder
+                    ),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = if (uiState.isFirewallActive) AmberWarning else TextSecondary
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CleaningServices,
+                        contentDescription = "Flush Firewall",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = "Flush",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricBox(
+    modifier: Modifier = Modifier,
+    label: String,
+    value: String,
+    valueColor: Color
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(9.dp),
+        color = SlateCardElevated.copy(alpha = 0.85f),
+        border = BorderStroke(1.dp, SlateBorder.copy(alpha = 0.8f))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 9.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = TextSecondary,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelMedium,
+                color = valueColor,
+                fontWeight = FontWeight.Bold,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsCard(
     uiState: GatekeeperUiState,
     onUpdateHeartbeatIp: (String) -> Unit,
     onUpdateGracePeriodMs: (Long) -> Unit,
@@ -724,21 +850,24 @@ private fun ConfigurationCard(
     onUpdateBlockIpv6: (Boolean) -> Unit,
     onUpdateCustomInterfaces: (String) -> Unit
 ) {
-    var expanded by remember { mutableStateOf(true) }
+    var expanded by remember { mutableStateOf(false) }
     var customIpText by remember(uiState.config.heartbeatIp) {
         mutableStateOf(uiState.config.heartbeatIp)
     }
 
+    val graceSec = String.format(Locale.US, "%.1f", uiState.config.gracePeriodMs / 1000f)
+    val baitSec = String.format(Locale.US, "%.1f", uiState.config.heartbeatIntervalMs / 1000f)
+
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = SlateCardSurface),
         border = BorderStroke(1.dp, SlateBorder)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
         ) {
             Row(
                 modifier = Modifier
@@ -747,36 +876,32 @@ private fun ConfigurationCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Icon(
                         imageVector = Icons.Default.Settings,
                         contentDescription = null,
                         tint = CyanAccent,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = "ANCHOR & FIREWALL PARAMETERS",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
-                            fontSize = 14.sp
-                        )
-                        Text(
-                            text = "Target: ${uiState.config.heartbeatIp}:53 | Grace: ${
-                                String.format(Locale.US, "%.1fs", uiState.config.gracePeriodMs / 1000f)
-                            } | Bait: ${
-                                String.format(Locale.US, "%.1fs", uiState.config.heartbeatIntervalMs / 1000f)
-                            }",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = TextSecondary
-                        )
-                    }
+                    Text(
+                        text = "Settings • ${uiState.config.heartbeatIp} • ${graceSec}s grace • ${baitSec}s bait",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextPrimary,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 Icon(
                     imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    contentDescription = "Toggle Configuration",
-                    tint = TextSecondary
+                    contentDescription = "Toggle Settings",
+                    tint = TextSecondary,
+                    modifier = Modifier.size(20.dp)
                 )
             }
 
@@ -784,18 +909,19 @@ private fun ConfigurationCard(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                        .padding(top = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     HorizontalDivider(color = SlateBorder.copy(alpha = 0.6f))
 
-                    // 1. Allowed Heartbeat IP Selector / Input
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // 1. Heartbeat IP (1.1.1.1 / 8.8.8.8 / Custom)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            text = "Allowed UDP Heartbeat IP (Whitelisted on Port 53 during LTE Lockdown)",
+                            text = "UDP Heartbeat Bait IP (Port 53)",
                             style = MaterialTheme.typography.bodyMedium,
                             color = TextPrimary,
-                            fontWeight = FontWeight.Medium
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 12.sp
                         )
 
                         Row(
@@ -852,9 +978,9 @@ private fun ConfigurationCard(
                             label = {
                                 Text(
                                     if (customIpText.trim().isNotEmpty() && !isCustomIpValid) {
-                                        "Heartbeat Target IPv4 (Enter valid IPv4, e.g. 1.1.1.1)"
+                                        "Custom IPv4 (Invalid format)"
                                     } else {
-                                        "Heartbeat Target IPv4"
+                                        "Custom Heartbeat IPv4"
                                     },
                                     style = MaterialTheme.typography.labelMedium
                                 )
@@ -871,7 +997,7 @@ private fun ConfigurationCard(
                         )
                     }
 
-                    // 2. Handover Grace Period Slider (0.5s to 5.0s, default 2.5s)
+                    // 2. Grace Period Slider
                     Column {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -881,20 +1007,16 @@ private fun ConfigurationCard(
                                 text = "Handover Grace Period",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextPrimary,
-                                fontWeight = FontWeight.Medium
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.sp
                             )
                             Text(
-                                text = String.format(Locale.US, "%.1f sec", uiState.config.gracePeriodMs / 1000f),
+                                text = "${graceSec}s",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = AmberWarning,
                                 fontWeight = FontWeight.Bold
                             )
                         }
-                        Text(
-                            text = "Delays iptables DROP on brief inter-tower 5G -> LTE handovers",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = TextSecondary
-                        )
                         Slider(
                             value = uiState.config.gracePeriodMs.toFloat(),
                             onValueChange = { raw ->
@@ -911,30 +1033,26 @@ private fun ConfigurationCard(
                         )
                     }
 
-                    // 3. Heartbeat ("Bait") Interval Slider (2.0s to 5.0s, default 3.0s)
+                    // 3. Bait Interval Slider
                     Column {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = "EN-DC Heartbeat (\"Bait\") Interval",
+                                text = "Bait Ping Interval",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextPrimary,
-                                fontWeight = FontWeight.Medium
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.sp
                             )
                             Text(
-                                text = String.format(Locale.US, "%.1f sec", uiState.config.heartbeatIntervalMs / 1000f),
+                                text = "${baitSec}s",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = CyanAccent,
                                 fontWeight = FontWeight.Bold
                             )
                         }
-                        Text(
-                            text = "Sends 1-byte UDP packet to port 53 while locked down to trigger 5G RRC upgrade",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = TextSecondary
-                        )
                         Slider(
                             value = uiState.config.heartbeatIntervalMs.toFloat(),
                             onValueChange = { raw ->
@@ -951,7 +1069,7 @@ private fun ConfigurationCard(
                         )
                     }
 
-                    // 4. IPv6 Leak Lockdown Switch
+                    // 4. IPv6 Lockdown Toggle
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -962,12 +1080,14 @@ private fun ConfigurationCard(
                                 text = "IPv6 Leak Lockdown (ip6tables)",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextPrimary,
-                                fontWeight = FontWeight.Medium
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.sp
                             )
                             Text(
-                                text = "Drop all IPv6 OUTPUT & FORWARD on cellular interfaces during LTE lockdown",
+                                text = "Block IPv6 cellular traffic during LTE lockdown",
                                 style = MaterialTheme.typography.labelMedium,
-                                color = TextSecondary
+                                color = TextSecondary,
+                                fontSize = 10.sp
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
@@ -983,13 +1103,13 @@ private fun ConfigurationCard(
                         )
                     }
 
-                    // 5. Optional Custom Interface Override
+                    // 5. Optional Extra Interfaces
                     OutlinedTextField(
                         value = uiState.config.customInterfaces,
                         onValueChange = onUpdateCustomInterfaces,
                         label = {
                             Text(
-                                "Extra Interfaces (optional, comma-separated, e.g. rmnet_data+)",
+                                "Extra Interfaces (optional, e.g. rmnet_data+)",
                                 style = MaterialTheme.typography.labelMedium
                             )
                         },
@@ -1024,14 +1144,14 @@ private fun TerminalLogCard(
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = SlateCardSurface),
         border = BorderStroke(1.dp, SlateBorder)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
@@ -1044,40 +1164,26 @@ private fun TerminalLogCard(
                         imageVector = Icons.Default.Terminal,
                         contentDescription = null,
                         tint = EmeraldGreen,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "LIVE GATEKEEPER EVENT LOG",
+                        text = "Live Log (${logs.size})",
                         style = MaterialTheme.typography.titleMedium,
                         color = TextPrimary,
-                        fontSize = 14.sp
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "(${logs.size})",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        fontSize = 13.sp
                     )
                 }
 
-                OutlinedButton(
+                IconButton(
                     onClick = onClearLogs,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                    modifier = Modifier.height(28.dp),
-                    border = BorderStroke(1.dp, SlateBorder)
+                    modifier = Modifier.size(26.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.DeleteSweep,
                         contentDescription = "Clear Logs",
                         tint = TextSecondary,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Clear",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        modifier = Modifier.size(17.dp)
                     )
                 }
             }
@@ -1085,10 +1191,10 @@ private fun TerminalLogCard(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(250.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .height(210.dp)
+                    .clip(RoundedCornerShape(8.dp))
                     .background(TerminalBg)
-                    .border(1.dp, SlateBorder.copy(alpha = 0.7f), RoundedCornerShape(10.dp))
+                    .border(1.dp, SlateBorder.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
                     .padding(8.dp)
             ) {
                 if (logs.isEmpty()) {
@@ -1097,7 +1203,7 @@ private fun TerminalLogCard(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "No events logged yet. Start 5G Anchor & Gatekeeper to monitor EN-DC transitions.",
+                            text = "No events logged yet.",
                             style = MaterialTheme.typography.labelMedium,
                             color = TextMuted
                         )
@@ -1137,9 +1243,10 @@ private fun TerminalLogRow(entry: LogEntry) {
             text = entry.timestamp,
             style = MaterialTheme.typography.labelMedium,
             color = TextMuted,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp
         )
-        Spacer(modifier = Modifier.width(6.dp))
+        Spacer(modifier = Modifier.width(5.dp))
         Surface(
             shape = RoundedCornerShape(4.dp),
             color = badgeColor.copy(alpha = 0.16f),
@@ -1147,20 +1254,21 @@ private fun TerminalLogRow(entry: LogEntry) {
         ) {
             Text(
                 text = entry.level.tag,
-                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
                 style = MaterialTheme.typography.labelMedium,
                 color = badgeColor,
                 fontWeight = FontWeight.Bold,
-                fontSize = 10.sp,
+                fontSize = 9.sp,
                 fontFamily = FontFamily.Monospace
             )
         }
-        Spacer(modifier = Modifier.width(6.dp))
+        Spacer(modifier = Modifier.width(5.dp))
         Text(
             text = entry.message,
             style = MaterialTheme.typography.labelMedium,
             color = TextPrimary,
             fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
             overflow = TextOverflow.Visible
         )
     }

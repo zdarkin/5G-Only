@@ -41,8 +41,8 @@ import kotlinx.coroutines.withContext
 /**
  * Persistent Foreground Service orchestrating the 5G NSA "Anchor" & Hotspot Gatekeeper:
  * 1. Fail-Closed Startup: Immediately locks down cellular `OUTPUT` and `FORWARD` traffic until
- *    5G NSA (`OVERRIDE_NETWORK_TYPE_NR_NSA` / `NR_ADVANCED`) is confirmed.
- * 2. Real-time TelephonyCallback monitoring of 5G NSA vs 4G LTE anchor state.
+ *    5G NSA (`NR State (NSA): CONNECTED`) is confirmed on the selected SIM slot.
+ * 2. Real-time TelephonyCallback monitoring pinned exclusively to the user's selected SIM (SIM 1 or SIM 2).
  * 3. Configurable Handover Grace Period countdown before locking down when dropping from 5G -> LTE.
  * 4. 5G Resurrection Heartbeat ("Bait") loop while in LTE lockdown to force the cellular modem
  *    into `RRC_CONNECTED` and trigger EN-DC 5G secondary cell re-attachment.
@@ -74,6 +74,7 @@ class AnchorGatekeeperService : Service() {
             onSnapshotChanged(snapshot)
         }
         observeFirewallConfigChanges()
+        observeSelectedSimChanges()
     }
 
     private fun observeFirewallConfigChanges() {
@@ -114,6 +115,62 @@ class AnchorGatekeeperService : Service() {
                             )
                             updateNotificationForState(GatekeeperRepository.uiState.value.anchorState)
                         }
+                    }
+                }
+        }
+    }
+
+    private fun observeSelectedSimChanges() {
+        serviceScope.launch {
+            GatekeeperRepository.uiState
+                .map { it.config.selectedSimSlot }
+                .distinctUntilChanged()
+                .drop(1)
+                .collect { newSlot ->
+                    if (isShuttingDown || !GatekeeperRepository.uiState.value.isServiceRunning) {
+                        return@collect
+                    }
+                    graceJob?.cancel()
+                    graceJob = null
+                    latestSnapshot = null
+
+                    stateMutex.withLock {
+                        if (isShuttingDown || !GatekeeperRepository.uiState.value.isServiceRunning) {
+                            return@withLock
+                        }
+                        GatekeeperRepository.updateState {
+                            it.copy(
+                                anchorState = NetworkAnchorState.STARTING_FAIL_CLOSED,
+                                graceRemainingMs = 0L,
+                                rawNetworkType = "Unknown",
+                                overrideNetworkType = "NONE",
+                                nrState = "NONE"
+                            )
+                        }
+                        GatekeeperRepository.log(
+                            LogLevel.INFO,
+                            "Target SIM changed to SIM ${newSlot + 1} -> Enforcing Fail-Closed & rebinding 5G NSA monitor exclusively to SIM ${newSlot + 1}"
+                        )
+                        val config = GatekeeperRepository.uiState.value.config
+                        firewallManager.applyLockdown(
+                            context = this@AnchorGatekeeperService,
+                            heartbeatIp = config.heartbeatIp,
+                            blockIpv6 = config.blockIpv6,
+                            customInterfaces = config.customInterfaces
+                        )
+                        heartbeatEngine.startBaitLoop()
+
+                        val rebindOk = telephonyMonitor.start(newSlot)
+                        if (!rebindOk) {
+                            GatekeeperRepository.updateState {
+                                it.copy(anchorState = NetworkAnchorState.ERROR)
+                            }
+                            GatekeeperRepository.log(
+                                LogLevel.ERROR,
+                                "Failed to rebind TelephonyCallback to SIM ${newSlot + 1}"
+                            )
+                        }
+                        updateNotificationForState(GatekeeperRepository.uiState.value.anchorState)
                     }
                 }
         }
@@ -160,9 +217,10 @@ class AnchorGatekeeperService : Service() {
                 graceRemainingMs = 0L
             )
         }
+        val selectedSlot = GatekeeperRepository.uiState.value.config.selectedSimSlot
         GatekeeperRepository.log(
             LogLevel.INFO,
-            "AnchorGatekeeperService starting in FAIL-CLOSED mode"
+            "AnchorGatekeeperService starting in FAIL-CLOSED mode (Target: SIM ${selectedSlot + 1})"
         )
 
         serviceScope.launch {
@@ -189,21 +247,21 @@ class AnchorGatekeeperService : Service() {
                 // 4. Start 5G Resurrection Heartbeat ("Bait") while in Fail-Closed state
                 heartbeatEngine.startBaitLoop()
 
-                // 5. Start TelephonyCallback monitor
-                val monitorStarted = telephonyMonitor.start()
+                // 5. Start TelephonyCallback monitor pinned exclusively to the selected SIM
+                val monitorStarted = telephonyMonitor.start(config.selectedSimSlot)
                 if (!monitorStarted) {
                     GatekeeperRepository.updateState {
                         it.copy(anchorState = NetworkAnchorState.ERROR)
                     }
                     GatekeeperRepository.log(
                         LogLevel.ERROR,
-                        "READ_PHONE_STATE permission missing or TelephonyCallback failed to register. Traffic remains Fail-Closed."
+                        "READ_PHONE_STATE permission missing or TelephonyCallback failed to register on SIM ${config.selectedSimSlot + 1}. Traffic remains Fail-Closed."
                     )
                     updateNotificationForState(NetworkAnchorState.ERROR)
                 } else {
                     GatekeeperRepository.log(
                         LogLevel.INFO,
-                        "TelephonyCallback registered (DisplayInfoListener + ServiceStateListener)"
+                        "TelephonyCallback registered for SIM ${config.selectedSimSlot + 1} (requiring NR State: CONNECTED)"
                     )
                     updateNotificationForState(GatekeeperRepository.uiState.value.anchorState)
                 }
@@ -213,12 +271,14 @@ class AnchorGatekeeperService : Service() {
 
     private fun onSnapshotChanged(snapshot: CellularSignalSnapshot) {
         if (isShuttingDown) return
+        if (snapshot.simSlotIndex != GatekeeperRepository.uiState.value.config.selectedSimSlot) return
         latestSnapshot = snapshot
 
         GatekeeperRepository.updateState {
             it.copy(
                 rawNetworkType = snapshot.networkTypeName,
-                overrideNetworkType = snapshot.overrideTypeName
+                overrideNetworkType = snapshot.overrideTypeName,
+                nrState = snapshot.nrState
             )
         }
 
@@ -236,7 +296,7 @@ class AnchorGatekeeperService : Service() {
                 job.cancel()
                 GatekeeperRepository.log(
                     LogLevel.INFO,
-                    "5G NSA re-attached during grace period (${snapshot.overrideTypeName}) -> Handover grace cancelled"
+                    "SIM ${snapshot.simSlotIndex + 1} 5G NSA re-attached during grace period (NR State: ${snapshot.nrState}) -> Handover grace cancelled"
                 )
             }
         }
@@ -268,7 +328,7 @@ class AnchorGatekeeperService : Service() {
                 if (previousState != NetworkAnchorState.CONNECTED_5G_NSA) {
                     GatekeeperRepository.log(
                         LogLevel.UNBLOCK,
-                        "5G NSA Active (${currentSnapshot.networkTypeName} / ${currentSnapshot.overrideTypeName}) -> Hotspot & Phone Traffic Allowed"
+                        "SIM ${currentSnapshot.simSlotIndex + 1} 5G NSA Active (${currentSnapshot.networkTypeName} / ${currentSnapshot.overrideTypeName} | NR State: ${currentSnapshot.nrState}) -> Hotspot & Phone Traffic Allowed"
                     )
                 }
 
@@ -311,6 +371,7 @@ class AnchorGatekeeperService : Service() {
                     }
                 }
             }
+            updateNotificationForState(NetworkAnchorState.LTE_LOCKDOWN_SEARCHING)
             return
         }
 
@@ -340,7 +401,7 @@ class AnchorGatekeeperService : Service() {
         updateNotificationForState(NetworkAnchorState.HANDOVER_GRACE_PERIOD)
         GatekeeperRepository.log(
             LogLevel.WARN,
-            "LTE detected (${snapshot.networkTypeName} / ${snapshot.overrideTypeName}) -> Starting ${gracePeriodMs}ms handover grace period"
+            "SIM ${snapshot.simSlotIndex + 1} 5G NSA dropped (${snapshot.networkTypeName} / ${snapshot.overrideTypeName} | NR State: ${snapshot.nrState}) -> Starting ${gracePeriodMs}ms handover grace period"
         )
 
         graceJob = serviceScope.launch {
@@ -377,7 +438,7 @@ class AnchorGatekeeperService : Service() {
 
             GatekeeperRepository.log(
                 LogLevel.BLOCK,
-                "Enforcing LTE Lockdown (${currentSnapshot.networkTypeName} / ${currentSnapshot.overrideTypeName}) -> Blocking traffic & engaging 5G Bait"
+                "SIM ${currentSnapshot.simSlotIndex + 1} Enforcing LTE Lockdown (${currentSnapshot.networkTypeName} / ${currentSnapshot.overrideTypeName} | NR State: ${currentSnapshot.nrState}) -> Blocking traffic & engaging 5G Bait"
             )
 
             firewallManager.applyLockdown(
@@ -499,26 +560,28 @@ class AnchorGatekeeperService : Service() {
     private fun updateNotificationForState(state: NetworkAnchorState) {
         if (isShuttingDown) return
         val uiState = GatekeeperRepository.uiState.value
+        val simNumber = (latestSnapshot?.simSlotIndex ?: uiState.config.selectedSimSlot) + 1
+        val nrState = latestSnapshot?.nrState ?: uiState.nrState
         val (title, body) = when (state) {
             NetworkAnchorState.CONNECTED_5G_NSA -> {
-                "5G NSA (Connected - Traffic Allowed)" to
-                    "Signal: ${uiState.rawNetworkType} / ${uiState.overrideNetworkType} | Hotspot & Phone Unblocked"
+                "SIM $simNumber: 5G NSA (Connected - Traffic Allowed)" to
+                    "SIM $simNumber | NR State: $nrState | ${uiState.rawNetworkType} / ${uiState.overrideNetworkType} | Unblocked"
             }
             NetworkAnchorState.HANDOVER_GRACE_PERIOD -> {
-                "LTE Handover Grace Period..." to
-                    "Waiting ${uiState.config.gracePeriodMs}ms before locking down cellular traffic"
+                "SIM $simNumber: LTE Handover Grace Period..." to
+                    "SIM $simNumber | NR State: $nrState | Waiting ${uiState.config.gracePeriodMs}ms before lockdown"
             }
             NetworkAnchorState.LTE_LOCKDOWN_SEARCHING -> {
-                "LTE (Blocking & Searching for 5G NSA...)" to
-                    "NSA_LOCKDOWN Active | Sending EN-DC Bait to ${uiState.config.heartbeatIp}"
+                "SIM $simNumber: LTE (Blocking & Searching for 5G NSA...)" to
+                    "SIM $simNumber | NR State: $nrState | NSA_LOCKDOWN Active | Bait -> ${uiState.config.heartbeatIp}"
             }
             NetworkAnchorState.STARTING_FAIL_CLOSED -> {
-                "Initializing (Fail-Closed Active)" to
-                    "Blocking LTE leaks while verifying 5G NSA state..."
+                "SIM $simNumber: Initializing (Fail-Closed Active)" to
+                    "SIM $simNumber | NR State: $nrState | Blocking LTE leaks until NR State: CONNECTED..."
             }
             NetworkAnchorState.ERROR -> {
-                "Error (Fail-Closed Active)" to
-                    "Check Shizuku & Phone Permissions in app"
+                "SIM $simNumber: Error (Fail-Closed Active)" to
+                    "SIM $simNumber | NR State: $nrState | Check Shizuku & Phone Permissions in app"
             }
             NetworkAnchorState.STOPPED -> {
                 "5G NSA Anchor Stopped" to

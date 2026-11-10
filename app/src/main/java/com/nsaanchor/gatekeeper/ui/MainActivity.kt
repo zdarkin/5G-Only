@@ -28,6 +28,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         hasTelephonyPermissions = checkRequiredTelephonyPermissions()
+        viewModel.refreshSims(this)
         val allGranted = results.values.all { it }
         if (allGranted) {
             GatekeeperRepository.log(
@@ -52,6 +53,7 @@ class MainActivity : ComponentActivity() {
         }
 
         hasTelephonyPermissions = checkRequiredTelephonyPermissions()
+        viewModel.refreshSims(this)
         if (!hasTelephonyPermissions) {
             requestRequiredRuntimePermissions()
         }
@@ -71,6 +73,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         hasTelephonyPermissions = checkRequiredTelephonyPermissions()
         ShizukuShellExecutor.refreshStatus()
+        viewModel.refreshSims(this)
     }
 
     private fun checkRequiredTelephonyPermissions(): Boolean {
