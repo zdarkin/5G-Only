@@ -324,7 +324,7 @@ class TelephonyNsaMonitor(
             try {
                 val result = ShizukuShellExecutor.execute(
                     command = "dumpsys telephony.registry",
-                    timeoutMs = 2500L
+                    timeoutMs = 4000L
                 )
                 if (!result.isSuccess || result.stdout.isBlank()) {
                     if (result.stderr.isNotBlank()) {
@@ -346,6 +346,11 @@ class TelephonyNsaMonitor(
                     GatekeeperRepository.log(
                         LogLevel.INFO,
                         "Shizuku Dumpsys parsed NR State (SIM ${simSlotIndex + 1}): $unredactedNrState"
+                    )
+                } else {
+                    GatekeeperRepository.log(
+                        LogLevel.WARN,
+                        "Shizuku Dumpsys: could not locate unredacted NR state for SIM ${simSlotIndex + 1}"
                     )
                 }
 
@@ -569,9 +574,15 @@ class TelephonyNsaMonitor(
         ): String? {
             if (dumpsysOutput.isBlank()) return null
 
-            // Locate "Phone Id=<simSlotIndex>" or "mPhoneId=<simSlotIndex>" or "slotId=<simSlotIndex>"
-            val phoneMarker = Regex("""(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*$simSlotIndex\b""", RegexOption.IGNORE_CASE)
-            val anyPhoneMarker = Regex("""(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*\d+\b""", RegexOption.IGNORE_CASE)
+            // Locate "Phone Id=<simSlotIndex>" or "mPhoneId=<simSlotIndex>" or "slotId=<simSlotIndex>" or "mServiceState[<simSlotIndex>]"
+            val phoneMarker = Regex(
+                """(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*$simSlotIndex\b|(?:Phone|mServiceState|Record)\[$simSlotIndex\]""",
+                RegexOption.IGNORE_CASE
+            )
+            val anyPhoneMarker = Regex(
+                """(?:Phone\s*Id|mPhoneId|slotId|mSlotIndex|mSimSlotIndex)\s*[=:]\s*\d+\b|(?:Phone|mServiceState|Record)\[\d+\]""",
+                RegexOption.IGNORE_CASE
+            )
 
             val startMatch = phoneMarker.find(dumpsysOutput)
             if (startMatch != null) {
@@ -662,19 +673,6 @@ class TelephonyNsaMonitor(
                 else -> (normalizedNrState == "CONNECTED" || hasNsaOverride) && isAnchorCapable
             }
             val isLteOnly = !is5gNsaOrBetter
-
-            return CellularSignalSnapshot(
-                simSlotIndex = simSlotIndex,
-                subscriptionId = subscriptionId,
-                networkType = networkType,
-                overrideNetworkType = overrideNetworkType,
-                nrState = normalizedNrState,
-                networkTypeName = networkTypeToName(networkType),
-                overrideTypeName = overrideTypeToName(overrideNetworkType),
-                is5gNsaOrBetter = is5gNsaOrBetter,
-                isLteOnly = isLteOnly
-            )
-        }
 
             return CellularSignalSnapshot(
                 simSlotIndex = simSlotIndex,
