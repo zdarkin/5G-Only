@@ -48,6 +48,16 @@
                 android:value="5G NSA cellular network anchor and iptables hotspot firewall enforcement" />
         </service>
 
+        <!-- Base Phone Sinkhole VPN Service for Non-Root UID 2000 Lockdown -->
+        <service
+            android:name=".firewall.GatekeeperVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"

@@ -18,11 +18,27 @@ import com.nsaanchor.gatekeeper.model.LogLevel
 import com.nsaanchor.gatekeeper.model.ShizukuStatus
 import com.nsaanchor.gatekeeper.ui.theme.NSA5GAnchorTheme
 
+import android.net.VpnService
+import androidx.lifecycle.lifecycleScope
+import com.nsaanchor.gatekeeper.firewall.GatekeeperVpnService
+import kotlinx.coroutines.launch
+
 class MainActivity : ComponentActivity() {
 
     private val viewModel: GatekeeperViewModel by viewModels()
 
     private var hasTelephonyPermissions by mutableStateOf(false)
+
+    private val vpnLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            GatekeeperRepository.log(
+                LogLevel.INFO,
+                "VPN permission confirmed by user"
+            )
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -57,6 +73,7 @@ class MainActivity : ComponentActivity() {
         if (!hasTelephonyPermissions) {
             requestRequiredRuntimePermissions()
         }
+        checkVpnPreparation()
 
         setContent {
             NSA5GAnchorTheme {
@@ -74,6 +91,19 @@ class MainActivity : ComponentActivity() {
         hasTelephonyPermissions = checkRequiredTelephonyPermissions()
         ShizukuShellExecutor.refreshStatus()
         viewModel.refreshSims(this)
+        checkVpnPreparation()
+    }
+
+    private fun checkVpnPreparation() {
+        val prepareIntent = VpnService.prepare(this)
+        if (prepareIntent != null) {
+            lifecycleScope.launch {
+                val autoGranted = GatekeeperVpnService.grantVpnAppOpsViaShizuku(packageName)
+                if (!autoGranted) {
+                    vpnLauncher.launch(prepareIntent)
+                }
+            }
+        }
     }
 
     private fun checkRequiredTelephonyPermissions(): Boolean {

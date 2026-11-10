@@ -167,4 +167,14 @@ class IptablesFirewallManagerTest {
         assertEquals("CONNECTED", TelephonyNsaMonitor.extractNrStateFromDumpsys(sampleDumpsys, simSlotIndex = 0))
         assertEquals("NONE", TelephonyNsaMonitor.extractNrStateFromDumpsys(sampleDumpsys, simSlotIndex = 1))
     }
+
+    @Test
+    fun `interface validation correctly approves concrete cellular and hotspot names`() {
+        assertTrue(IptablesFirewallManager.isValidInterfaceName("rmnet_data0"))
+        assertTrue(IptablesFirewallManager.isValidInterfaceName("ccmni0"))
+        assertTrue(IptablesFirewallManager.isValidInterfaceName("ap0"))
+        assertTrue(IptablesFirewallManager.isValidInterfaceName("wlan1"))
+        assertTrue(IptablesFirewallManager.isValidInterfaceName("swlan0"))
+        assertFalse(IptablesFirewallManager.isValidInterfaceName("rmnet_data0; reboot"))
+    }
 }

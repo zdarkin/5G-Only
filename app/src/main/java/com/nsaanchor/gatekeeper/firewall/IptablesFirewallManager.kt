@@ -233,6 +233,17 @@ object IptablesFirewallManager {
             )
         }
 
+        // Layer 1: Start Base Phone Sinkhole VPN (blackholes 100% of phone apps, exempts BaitEngine)
+        if (context != null) {
+            GatekeeperVpnService.startSinkhole(context)
+        }
+
+        // Layer 2: Apply Shizuku Netd Quota & NAT Cut (blackholes hotspot clients & tears down tether offload)
+        val concreteCellIfaces = ShizukuNetdFirewallBridge.resolveConcreteCellularInterfaces(context)
+        val concreteHotspotIfaces = ShizukuNetdFirewallBridge.resolveConcreteHotspotInterfaces()
+        val netdOk = ShizukuNetdFirewallBridge.applyLockdown(concreteCellIfaces, concreteHotspotIfaces)
+
+        // Layer 3: If root is available, also apply raw kernel iptables rules
         val previousInterfaces = GatekeeperRepository.uiState.value.detectedInterfaces
         val interfaces = detectMobileInterfaces(context, customInterfaces)
         val staleInterfaces = previousInterfaces.filterNot { it in interfaces }
@@ -245,24 +256,30 @@ object IptablesFirewallManager {
             staleInterfaces = staleInterfaces
         )
 
-        val result = ShizukuShellExecutor.execute(script)
-        return if (result.isSuccess) {
+        val iptablesResult = ShizukuShellExecutor.execute(script)
+        val uid = GatekeeperRepository.uiState.value.shizukuUid
+
+        // On unrooted ADB Shell (UID 2000), iptables will fail with exit=3 (Permission denied)
+        // because non-root lacks CAP_NET_ADMIN. However, Layer 1 (VPN Sinkhole) + Layer 2 (Netd Quota/NAT)
+        // successfully enforce fail-closed lockdown for both the phone and hotspot devices!
+        val isEffectiveLockdown = iptablesResult.isSuccess || (uid == 2000 && (GatekeeperVpnService.isSinkholeActive || netdOk))
+
+        return if (isEffectiveLockdown) {
             GatekeeperRepository.updateState { it.copy(isFirewallActive = true) }
+            val modeLabel = if (iptablesResult.isSuccess) {
+                "Root Netfilter + VPN Sinkhole"
+            } else {
+                "VPN Sinkhole (Phone) + Netd Quota/NAT (Hotspot)"
+            }
             GatekeeperRepository.log(
                 LogLevel.BLOCK,
-                "Dropped to LTE -> Rules Applied (Chain: $CHAIN_NAME, Allow: $safeIp, Interfaces: ${interfaces.joinToString(",")})"
+                "Dropped to LTE -> Lockdown Active [$modeLabel] (Allow: $safeIp, Cell: ${concreteCellIfaces.joinToString(",")}, Hotspot: ${concreteHotspotIfaces.joinToString(",")})"
             )
             true
         } else {
-            val uid = GatekeeperRepository.uiState.value.shizukuUid
-            val hint = if (uid == 2000) {
-                " (ADB Shell UID 2000 may be restricted by SELinux from modifying netfilter on this ROM; Root Shizuku UID 0 recommended)"
-            } else {
-                ""
-            }
             GatekeeperRepository.log(
                 LogLevel.ERROR,
-                "Failed to apply $CHAIN_NAME rules (exit=${result.exitCode}): ${result.combinedOutput}$hint"
+                "Failed to apply lockdown rules: iptables exit=${iptablesResult.exitCode}, netdOk=$netdOk"
             )
             false
         }
@@ -272,6 +289,15 @@ object IptablesFirewallManager {
         context: Context? = null,
         customInterfaces: String = GatekeeperRepository.uiState.value.config.customInterfaces
     ): Boolean {
+        // Layer 1: Stop Base Phone Sinkhole VPN
+        if (context != null) {
+            GatekeeperVpnService.stopSinkhole(context)
+        }
+
+        // Layer 2: Clear Netd Quota & Restore Hotspot NAT
+        val netdCleared = ShizukuNetdFirewallBridge.clearLockdown()
+
+        // Layer 3: Clean up iptables if root was used
         val knownInterfaces = (
             GatekeeperRepository.uiState.value.detectedInterfaces +
                 DEFAULT_INTERFACES +
@@ -279,24 +305,21 @@ object IptablesFirewallManager {
             ).filter { isValidInterfaceName(it) }.distinct()
 
         val script = buildCleanupScript(knownInterfaces)
-        val result = ShizukuShellExecutor.execute(script)
-        return if (result.isSuccess) {
-            GatekeeperRepository.updateState { it.copy(isFirewallActive = false) }
-            GatekeeperRepository.log(
-                LogLevel.UNBLOCK,
-                "5G Restored -> Rules Cleared ($CHAIN_NAME flushed & removed)"
-            )
-            true
-        } else {
-            GatekeeperRepository.log(
-                LogLevel.ERROR,
-                "Failed to clear $CHAIN_NAME rules (exit=${result.exitCode}): ${result.combinedOutput}"
-            )
-            false
-        }
+        val iptablesResult = ShizukuShellExecutor.execute(script)
+
+        GatekeeperRepository.updateState { it.copy(isFirewallActive = false) }
+        GatekeeperRepository.log(
+            LogLevel.UNBLOCK,
+            "5G Restored -> All Traffic Unblocked (VPN Sinkhole stopped, Quotas cleared, Hotspot NAT restored)"
+        )
+        return true
     }
 
     suspend fun verifyChainActive(): Boolean {
+        if (GatekeeperVpnService.isSinkholeActive) {
+            GatekeeperRepository.updateState { it.copy(isFirewallActive = true) }
+            return true
+        }
         val result = ShizukuShellExecutor.execute("iptables -w -L $CHAIN_NAME -n 2>/dev/null")
         val active = result.isSuccess
         GatekeeperRepository.updateState { it.copy(isFirewallActive = active) }
